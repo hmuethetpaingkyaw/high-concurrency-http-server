@@ -1,0 +1,28 @@
+# Resource limits emulate EC2 sizes. Override per level, e.g.:
+#   APP_CPUS=0.5 APP_MEM=512m docker compose up -d --build
+services:
+  app:
+    build: .
+    image: hcs-app:latest
+    ports:
+      - "8080:8080" # for manual curl only; load tests stay inside the Docker network
+    environment:
+      CPU_ROUNDS: "${CPU_ROUNDS:-5000}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${APP_CPUS:-0.1}"   # level 0: a starved t3.nano
+          memory: "${APP_MEM:-128m}"
+
+  k6:
+    image: grafana/k6:1.0.0
+    profiles: ["load"] # only started via `docker compose run k6 ...`
+    environment:
+      K6_NO_USAGE_REPORT: "true" # also works around a compose panic on `run -e` with no environment block
+    volumes:
+      - ./loadtest:/scripts:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2" # own budget so the load generator never steals the app's CPU
+          memory: 1g
