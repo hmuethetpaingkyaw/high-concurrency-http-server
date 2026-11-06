@@ -13,11 +13,57 @@ services:
       MAX_INFLIGHT_FAST: "${MAX_INFLIGHT_FAST:-}"
       MAX_INFLIGHT_IO: "${MAX_INFLIGHT_IO:-}"
       MAX_INFLIGHT_CPU: "${MAX_INFLIGHT_CPU:-}"
+      MAX_INFLIGHT_DB: "${MAX_INFLIGHT_DB:-}"
+      # Level 3: Postgres + Redis. Every fix is a toggle; defaults are the naive
+      # (step 0) behavior. See docs/LEVEL3_GUIDE.md.
+      DATABASE_URL: "postgres://app:app@postgres:5432/shop?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      DB_POOL: "${DB_POOL:-off}"            # step 1: on = connection pool
+      DB_MAX_CONNS: "${DB_MAX_CONNS:-10}"   # step 1: pool size
+      DB_TIMEOUT: "${DB_TIMEOUT:-0}"        # step 2: e.g. 300ms; 0 = no timeout
+      LIST_QUERY: "${LIST_QUERY:-n+1}"      # step 3: join = one query
+      CACHE: "${CACHE:-off}"                # step 4: on = Redis cache-aside
+      CACHE_TTL: "${CACHE_TTL:-30s}"
+      SINGLEFLIGHT: "${SINGLEFLIGHT:-off}"  # step 5: on = one DB load per key
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     deploy:
       resources:
         limits:
           cpus: "${APP_CPUS:-0.5}"   # level 2: half a vCPU (levels 0-1 used 0.1 / 128m)
           memory: "${APP_MEM:-512m}"
+
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: shop
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1: TCP only opens after the init scripts have finished
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d shop"]
+      interval: 2s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1" # ~ db.t4g.small; max_connections stays at the default 100
+          memory: 1g
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5" # ~ cache.t4g.micro
+          memory: 256m
 
   k6:
     image: grafana/k6:1.0.0
@@ -41,3 +87,6 @@ services:
         limits:
           cpus: "0.5"
           memory: 256m
+
+volumes:
+  pgdata:

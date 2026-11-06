@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-05 · Current level: **2 (done: survives overload)** · Next: re-baseline the roadmap, then Level 3
+Last updated: 2026-11-06 · Current level: **3, step 0 recorded (naive ceiling ~340 RPS)** · Next: step 1 (connection pool)
 
 ## 1. Goal and rules
 
@@ -75,7 +75,25 @@ Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/m
 
 ## 4. Test results
 
-### Level 2 (2026-11-05)
+### Level 3, step 0: naive baseline (2026-11-06)
+
+All switches off: a new Postgres connection per request, no timeouts, N+1 list, no cache. App 0.5 CPU / 512 MB, Postgres 1 CPU / 1 GB (`max_connections` 100), k6 `HOT_RATIO=0.8`. 30 s per run; the app restarts before each run so counters start at 0. CPU sampled every ~2 s.
+
+| Endpoint | RATE | Achieved | p99 | Errors | Dropped | App CPU | Postgres CPU | Max PG conns | `db_connects` | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `/products/{id}` | 100 | 100/s | 5.3 ms | 0% | 0 | 11-12% | 26-28% | 1 | 3,000 (1 per request) | PASS |
+| `/products/{id}` | 300 (×2) | 300/s | 3.9 / 5.1 ms | 0% | 0 | 22% | 49-56% | 1 | 9,000 | PASS |
+| `/products/{id}` | **340** | 340/s | 5.6 ms | 0% | 0 | 24-26% | 55-62% | 2 | 10,201 | **PASS (ceiling)** |
+| `/products/{id}` | 375 | 285/s | 5 s | 36% | 1,486 | 27-33% | **100%** | 57 | 7,236 | FAIL |
+| `/products/{id}` | 450 | 364/s | 5 s | 53% | 1,197 | 30-36% | 99-108% | 41 | 6,878 | FAIL |
+| `/products/{id}` | 525 | 428/s | 5 s | 59% | 986 | 31-33% | 102-139% | 57 | 7,364 | FAIL |
+| `/products/{id}` | 600 | 500/s | 5 s | 64% | 964 | 31-35% | 101-109% | 52 | 7,354 | FAIL |
+| `/products?category={cat}` | 100 | 100/s | 6.3 ms | 0% | 0 | 14% | 29-31% | 1 | 3,001 (63,021 queries = 21 per request) | PASS |
+| `POST /orders` | 100 | 100/s | 7.4 ms | 0% | 0 | 11-13% | 28-32% | 1 | 3,000 (6,000 queries) | PASS |
+
+Errors in the failing runs: `db_errors` 1,408-1,690 per run (connection failures: `connection reset by peer` and `FATAL: sorry, too many clients already`). The rest were k6's 5 s timeouts. Postgres logged **7,275** "too many clients" rejections across the failing runs. `db_last_error` only shows the most recent error, so it doesn't show how often each kind happened.
+
+
 
 **2a. Failures first (Level 1 code, 0.1 CPU / 128 MB)**
 
@@ -177,6 +195,17 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
   | `time.Sleep(...)` | Yes | No | No |
   | `writeJSON(... requests)` | Yes | Yes (reads `requests`) | No, if the value is saved earlier |
 
+**F9. A new connection per request makes Postgres CPU the ceiling (~340 RPS): OPEN (Level 3, step 1)**
+- Symptom: `/products/{id}` passes at 340 RPS, then collapses at 375: 36% errors, p99 5 s, Postgres CPU at 100% of its 1 CPU. The app sits at ~30% CPU, so it isn't the bottleneck.
+- Cause: every request opens a new connection. Postgres forks a new backend process and checks the password (SCRAM) each time. That costs Postgres ~1.7 ms of CPU per request (50% CPU at 300 RPS), and almost all of it is connection setup, not the query: the list endpoint runs **21 queries** per request and costs about the same Postgres CPU as the 1-query product endpoint (29% vs 27% at 100 RPS).
+- **It's a cliff, not a slope:** Postgres CPU was 57% at 340 RPS but 100% at 375. Once Postgres falls slightly behind, connections take longer, so more are open at once (1-2 jumps to 41-57). Each one is another process competing for the same CPU, so everything slows further: a feedback loop. Near the limit of 100 connections, Postgres starts refusing (`too many clients`) and resetting connections.
+- Fix (step 1): a connection pool. Connections are opened once and reused, so the setup cost disappears and the number of connections is capped.
+
+**F10. Work continues for clients that already gave up: OPEN (Level 3, step 2)**
+- Symptom: in the failing runs, the app completed more queries than successful responses. At 375 RPS, 7,236 queries ran but only 6,225 requests succeeded, so ~1,000 queries finished after k6 had already timed out at 5 s. At 600 RPS: 7,354 vs 6,129.
+- Cause: the naive code uses `context.Background()`, so DB work ignores the client hanging up and has no deadline. During overload, the database spends CPU on answers nobody receives.
+- Fix (step 2): `DB_TIMEOUT` ties DB work to the request's context and adds a deadline.
+
 **F2. Tail latency from CPU throttling: OPEN (smaller at 0.5 CPU)**
 - Symptom: p99 is much higher than p50 even in passing runs (Level 1 at 500 RPS: p50 26 ms, p99 124 ms).
 - Cause: a 0.1 CPU limit lets the app use 10 ms of CPU in every 100 ms window. Once used up, the process waits for the next window, adding up to ~100 ms to unlucky requests.
@@ -226,13 +255,15 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 - Cause: k6 pre-allocated `RATE x 2 / 4` VUs (thousands).
 - Fix: pre-allocate `RATE / 5` VUs (enough for 200 ms latency), grow on demand; k6 budget 3 CPU / 3 GB. A few dropped iterations at the start can still come from VU growth.
 
-## 6. Next: re-baseline the roadmap
+## 6. Level 3 plan: Postgres + Redis
 
-Level 2 changed the picture: on half a vCPU, `/io` already does ~8,000 RPS, close to the original Level 5 target, while the roadmap below assumed much lower numbers. Before Level 3, agree on new targets. Questions to settle:
+**Decided 2026-11-06:** add a real Postgres and Redis. Claude implements the code; I run the tests myself with [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md).
 
-1. Should `/io` stay this cheap, or should it simulate a realistic downstream (variable latency, occasional slow calls)? A real DB or Redis (the original Level 3) would do that.
-2. Should the box shrink back (e.g. 0.25 CPU) so later levels have something left to fix before 10k?
-3. Where should 10k RPS be proven: one instance, or several behind a load balancer (Level 5), which is also where F7 gets fixed?
+- **New:** Postgres 16 (1 CPU / 1 GB, 100k products), Redis 7 (0.5 CPU / 256 MB). Endpoints `GET /products/{id}`, `GET /products?category=`, `POST /orders`.
+- **Every fix is a switch, off by default (naive):** `DB_POOL`, `DB_TIMEOUT`, `LIST_QUERY=join`, `CACHE`, `SINGLEFLIGHT`.
+- **Steps:** 0 naive baseline → 1 connection pool (and pool sizing) → 2 query timeouts under a frozen DB → 3 N+1 vs join → 4 Redis cache-aside (hit ratio vs traffic skew) → 5 cache stampede with singleflight. Bonus: hot-row lock contention on orders.
+- **Target:** `GET /products/{id}` passes the SLO at 5,000 RPS on the 0.5 CPU app.
+- **Claude's smoke checks (single requests, not load tests):** each switch does what it says. Pool: 20 requests used 1 connection. Timeout: frozen DB gives `504` in 0.30 s vs a 3.2 s hang. List: 21 queries vs 1. Cache: an order invalidates the cached product. Singleflight: 300 parallel misses on one key make 300 queries vs 1.
 
 ## 7. Level roadmap
 
@@ -241,12 +272,12 @@ Level 2 changed the picture: on half a vCPU, `/io` already does ~8,000 RPS, clos
 | 0 | 0.1 / 128 MB | ~100 RPS (fails) | Global lock, CPU throttling | Baseline, profiling with pprof |
 | 1 | 0.1 / 128 MB | 500 (reached ~875) | Lock held during I/O | Narrow critical sections, atomics |
 | 2 | 0.5 / 512 MB | 1,000 (reached: `/io` ceiling ~8,000; survives 3x `/cpu` spike and 10k slowloris) | Unbounded goroutines and memory under spikes | Timeouts, size limits, GOMEMLIMIT, bounded concurrency, load shedding (fast 503) |
-| 3 | 0.5 / 512 MB | 2,500 | Slow dependency calls | Caching, connection reuse (DB/Redis added here) |
-| 4 | 1 / 1 GB | 5,000 | GC pressure from allocations | Allocation profiling, sync.Pool, cheaper JSON |
-| 5 | 3 × (1 / 1 GB) + nginx | 8,000 | A single instance's limit | Horizontal scaling, load balancer, upstream keep-alive |
-| 6 | 3 × (1 / 1 GB) + nginx | 10,000, 0 errors during redeploys | Dropped requests on shutdown | Graceful shutdown, readiness draining |
+| 3 | app 0.5 / 512 MB + Postgres 1 / 1 GB + Redis 0.5 / 256 MB | `GET /products/{id}` 5,000 | Connection churn, no timeouts, N+1, no cache, stampedes | Pooling, timeouts, joins, cache-aside, singleflight |
+| 4 | 0.5 / 512 MB | CPU per request down | GC pressure from allocations | Allocation profiling, sync.Pool, cheaper JSON |
+| 5 | 3 app instances + load balancer | 10,000 | A single instance's limit; F7 | Horizontal scaling, load balancer, shedding at the edge |
+| 6 | same as 5 | 10,000, 0 errors during redeploys | Dropped requests on shutdown | Graceful shutdown, readiness draining |
 
-`/cpu` at 10k RPS would need ~3.5 full cores (measured ~1,400 RPS per 0.5 CPU). It will hit the hardware limit first, so its target is set separately. Levels 3-6 targets are under review (section 6).
+`/cpu` at 10k RPS would need ~3.5 full cores (measured ~1,400 RPS per 0.5 CPU). It will hit the hardware limit first, so its target is set separately. Roadmap re-baselined 2026-11-06.
 
 ## 8. Change log
 
@@ -254,6 +285,7 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-06 | 3 (step 0) | Postgres + Redis added; all fixes behind switches, off by default. Measured the naive baseline. | - | `/products/{id}` ceiling ~340 RPS (375 collapses, Postgres CPU 100%) | Connection per request (F9), no deadlines (F10) |
 | 2026-11-05 | 2 | Load shedding: per-endpoint in-flight caps with immediate `503` + `Retry-After`. `/io` and `/fast` 1,000; `/cpu` = GOMAXPROCS (a cap of 50 failed, F6). pprof moved to internal `:6060`. | `/cpu` 2,000 spike: p99 3.94 s, 10,989 dropped, 209 MiB | `/cpu` 4,000 spike: accepted p99 145 ms, 66% shed, 50 MiB | F7: shedding in front of the server |
 | 2026-11-05 | 2 | Timeouts, header/body limits, Go memory limit from cgroup (90%). | 10k slowloris: OOM-killed | All 10k closed by server, 0% errors | Unbounded in-flight requests |
 | 2026-11-05 | 2 | Bigger box: 0.5 CPU / 512 MB. Tooling: `make spike` (spike SLO), `cmd/slowloris`, k6 VU pre-allocation fix and 3 CPU / 3 GB budget. | `/io` ceiling ~875 RPS (0.1 CPU) | `/io` ceiling ~8,000 RPS | Overload protection |
