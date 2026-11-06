@@ -85,6 +85,9 @@ func newShop() *shop {
 			log.Fatalf("DATABASE_URL: %v", err)
 		}
 		cfg.MaxConns = int32(envInt("DB_MAX_CONNS", 10))
+		// MinConns connections are opened at startup and kept open, so early
+		// requests don't wait for a brand-new connection (0 = open on demand).
+		cfg.MinConns = int32(envInt("DB_MIN_CONNS", 0))
 		cfg.AfterConnect = func(context.Context, *pgx.Conn) error {
 			dbConnects.Add(1)
 			return nil
@@ -123,6 +126,7 @@ func newShop() *shop {
 		return map[string]any{
 			"DB_POOL":      s.pool != nil,
 			"DB_MAX_CONNS": envInt("DB_MAX_CONNS", 10),
+			"DB_MIN_CONNS": envInt("DB_MIN_CONNS", 0),
 			"DB_TIMEOUT":   s.dbTimeout.String(),
 			"LIST_QUERY":   map[bool]string{true: "join", false: "n+1"}[s.listJoin],
 			"CACHE":        s.cache != nil,

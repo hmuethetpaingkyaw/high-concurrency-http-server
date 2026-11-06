@@ -86,6 +86,7 @@ Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/m
 | Pool size sweep at 7,000 RPS | Inconclusive: all sizes failed by 0.6-1.9% in this batch, noise bigger than the effect |
 | Ceiling (pool 20) | **~8,000 RPS** (8,000 ✅, 8,500 ❌ 0.21% shed). App CPU at its quota (52%), Postgres ~37% |
 | Stability 5,500-7,000 | 5 of 13 runs failed by 0.1-2% `503`s, 0 DB errors (F11) |
+| Warm pool (`DB_MIN_CONNS=10`, max 10) at 300 RPS | 0 waits vs 7 waits (~5 ms each, one per new connection) with a cold pool. Same p99 (1.5 ms): only matters when a pool grows under heavy load |
 
 ### Level 3, step 0: naive baseline (2026-11-06)
 

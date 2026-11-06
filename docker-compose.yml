@@ -20,6 +20,7 @@ services:
       REDIS_ADDR: "redis:6379"
       DB_POOL: "${DB_POOL:-off}"            # step 1: on = connection pool
       DB_MAX_CONNS: "${DB_MAX_CONNS:-10}"   # step 1: pool size
+      DB_MIN_CONNS: "${DB_MIN_CONNS:-0}"    # step 1: connections opened at startup
       DB_TIMEOUT: "${DB_TIMEOUT:-0}"        # step 2: e.g. 300ms; 0 = no timeout
       LIST_QUERY: "${LIST_QUERY:-n+1}"      # step 3: join = one query
       CACHE: "${CACHE:-off}"                # step 4: on = Redis cache-aside

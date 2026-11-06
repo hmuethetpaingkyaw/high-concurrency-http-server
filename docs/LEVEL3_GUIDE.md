@@ -24,7 +24,7 @@ k6 picks the ids: `{id}` sends 80% of requests to the 1,000 most popular product
 
 | Step | Switch | Off (naive, default) | On (fixed) |
 | --- | --- | --- | --- |
-| 1 | `DB_POOL=on` (+ `DB_MAX_CONNS`, default 10) | New connection for every request | Reuse a pool of connections |
+| 1 | `DB_POOL=on` (+ `DB_MAX_CONNS`, default 10; `DB_MIN_CONNS`, default 0) | New connection for every request | Reuse a pool of connections |
 | 2 | `DB_TIMEOUT=300ms` | `context.Background()`: DB work never gives up | Deadline tied to the request; `504` when it passes |
 | 3 | `LIST_QUERY=join` | N+1: 21 queries per page of 20 | 1 query with a JOIN |
 | 4 | `CACHE=on` (+ `CACHE_TTL`, default 30s) | Every read goes to Postgres | Redis cache-aside for `GET /products/{id}` |
@@ -153,6 +153,24 @@ done
 - **5-20 is the sweet spot:** almost no waiting, best p99 at 20.
 - **90 got worse again:** fewer waits (437) but much longer ones (~49 ms each on average). Likely cause: the pool opens connections only when needed, so with 90 it keeps opening new ones during the test, and each one waits for the expensive Postgres setup from step 0. Not verified; pre-opening connections (`MinConns`) would test it.
 - **Little's Law check:** Postgres is at ~20% CPU and the queries are fast, so only a few connections are busy at once. More connections can't help, only cost.
+
+**Warm pool (`DB_MIN_CONNS`), recorded 2026-11-06 by Claude.** `DB_MIN_CONNS` opens that many connections at startup and keeps them open; the default 0 opens them only when a request needs one. 300 RPS, 30 s, `DB_MAX_CONNS=10`:
+
+```sh
+DB_POOL=on DB_MAX_CONNS=10 DB_MIN_CONNS=10 make up
+make -s vars | grep db_pool        # before any request: total 10, idle 10
+make load ENDPOINT='/products/{id}' RATE=300 DURATION=30s
+```
+
+| Pool | Connections opened | `had_to_wait` | `wait_total_ms` | p50 | p99 | App / Postgres CPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| min 10 / max 10 (warm) | 10, at startup | **0** | 4 | 0.68 ms | 1.51 ms | 13% / 6% |
+| min 0 / max 10 (cold) | 7, during the test | 7 | 38 | 0.68 ms | 1.44 ms | 13% / 6% |
+
+- **Cold pool:** exactly 7 requests waited, one for each new connection, ~5 ms each (38 ms ÷ 7). After that, nothing waited.
+- **Warm pool:** no request ever waited for a connection.
+- **At 300 RPS the difference doesn't matter:** 7 of 9,000 requests paid ~5 ms, and p99 is the same. It matters when a pool grows **under heavy load**: at 1,500 RPS with max 90, each wait averaged ~49 ms, because opening a connection gets slower when Postgres is busy. This run supports that explanation but doesn't test 90 under load directly.
+- **Trade-off:** warm connections hold Postgres memory all the time, and with several app instances `instances × DB_MIN_CONNS` must fit under `max_connections` (100).
 
 **Same sweep near the ceiling (7,000 RPS): inconclusive.** All six sizes failed by 0.6-1.9% (`503`s from the in-flight cap), including size 20, which passed at 7,000 in two other runs. Near the ceiling, run-to-run noise is bigger than the pool-size effect.
 
