@@ -86,15 +86,29 @@ make load ENDPOINT='/products?category={cat}' RATE=100 DURATION=30s
 make load ENDPOINT=/orders METHOD=POST RATE=100 DURATION=30s
 ```
 
-| Endpoint | RATE | p99 | Errors | `db_connects` | Max Postgres connections | `db_last_error` | Pass? |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `/products/{id}` | 100 | | | | | | |
-| `/products/{id}` | 300 | | | | | | |
-| `/products/{id}` | 600 | | | | | | |
-| list | 100 | | | | | | |
-| orders | 100 | | | | | | |
+**Recorded 2026-11-06 by Claude** (30 s runs; app restarted before each run):
+
+| Endpoint | RATE | p99 | Errors | `db_connects` | Max Postgres connections | App / Postgres CPU | `db_last_error` | Pass? |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `/products/{id}` | 100 | 5.3 ms | 0% | 3,000 | 1 | 12% / 27% | - | ✅ |
+| `/products/{id}` | 300 (×2) | 3.9 / 5.1 ms | 0% | 9,000 | 1 | 22% / 50% | - | ✅ |
+| `/products/{id}` | **340** | 5.6 ms | 0% | 10,201 | 2 | 25% / 57% | - | ✅ **ceiling** |
+| `/products/{id}` | 375 | 5 s | 36% | 7,236 | 57 | 30% / **100%** | `connection reset by peer` | ❌ |
+| `/products/{id}` | 450 | 5 s | 53% | 6,878 | 41 | 32% / 100% | `connection reset by peer` | ❌ |
+| `/products/{id}` | 525 | 5 s | 59% | 7,364 | 57 | 32% / 100% | `too many clients already` | ❌ |
+| `/products/{id}` | 600 | 5 s | 64% | 7,354 | 52 | 33% / 100% | `connection reset by peer` | ❌ |
+| list | 100 | 6.3 ms | 0% | 3,001 (63,021 queries) | 1 | 14% / 29% | - | ✅ |
+| orders | 100 | 7.4 ms | 0% | 3,000 (6,000 queries) | 1 | 12% / 29% | - | ✅ |
+
+Postgres logged 7,275 "too many clients" rejections across the failing runs.
 
 **Questions:** At what rate do errors start? Is the bottleneck the app's CPU, Postgres's CPU, or the connection limit?
+
+**Answers:**
+- **Errors start between 340 (pass) and 375 RPS (36% errors).** It's a cliff, not a slope.
+- **Postgres CPU is the bottleneck.** It hits 100% of its 1 CPU while the app sits at ~30%. Each new connection costs Postgres ~1.7 ms of CPU (a new process plus a password check), much more than the query itself. The list endpoint runs 21 queries per request but uses about the same Postgres CPU as the 1-query endpoint.
+- **The connection limit comes second.** Once Postgres falls behind, connections pile up (1-2 → 41-57 open), and near 100 Postgres refuses and resets them.
+- **Wasted work:** at 375 RPS, 7,236 queries ran but only 6,225 requests succeeded. ~1,000 answers finished after k6 had given up, because the naive code uses `context.Background()` (fixed in step 2).
 
 ---
 
@@ -107,6 +121,13 @@ make load ENDPOINT='/products/{id}' RATE=600 DURATION=30s     # same rate that f
 
 **Watch:** `db_connects` should stop at about `DB_MAX_CONNS`, and `make pgconns` should stay at or below the pool size.
 
+**Recorded 2026-11-06 by Claude:**
+
+| `/products/{id}` at 600 RPS | p99 | Errors | `db_connects` | Max PG connections | App / Postgres CPU | Pass? |
+| --- | --- | --- | --- | --- | --- | --- |
+| Step 0 (pool off) | 5 s | 64% | 7,354 (1 per request) | 52 | 33% / 100% | ❌ |
+| **Step 1 (pool on, size 10)** | **3.1 ms** | **0%** | **10 in total** | 10 | 22% / **13%** | ✅ |
+
 **Now size the pool.** Hold one rate and change only the pool size:
 ```sh
 for n in 2 5 10 20 50 90; do
@@ -116,14 +137,24 @@ for n in 2 5 10 20 50 90; do
 done
 ```
 
-| `DB_MAX_CONNS` | p99 | Errors | Dropped | `had_to_wait` | `wait_total_ms` | Postgres CPU |
+**Recorded 2026-11-06 by Claude** (1,500 RPS, 30 s, 45,000 acquires per run; all runs pass):
+
+| `DB_MAX_CONNS` | p99 | Errors | Dropped | `had_to_wait` | `wait_total_ms` | App / Postgres CPU |
 | --- | --- | --- | --- | --- | --- | --- |
-| 2 | | | | | | |
-| 5 | | | | | | |
-| 10 | | | | | | |
-| 20 | | | | | | |
-| 50 | | | | | | |
-| 90 | | | | | | |
+| 2 | 7.8 ms | 0% | 0 | 9,186 (20%) | 18,557 | 30% / 18% |
+| 5 | 2.3 ms | 0% | 0 | 497 | 956 | 30% / 20% |
+| 10 | 2.0 ms | 0% | 0 | 262 | 278 | 30% / 19% |
+| **20** | **1.6 ms** | 0% | 0 | 127 | 193 | 31% / 20% |
+| 50 | 2.9 ms | 0% | 0 | 83 | 857 | 30% / 19% |
+| 90 | 20.3 ms | 0% | 0 | 437 | 21,291 | 31% / 23% |
+
+**What it shows:**
+- **2 is too small:** 1 in 5 requests waited for a connection, 18.6 s of waiting in total.
+- **5-20 is the sweet spot:** almost no waiting, best p99 at 20.
+- **90 got worse again:** fewer waits (437) but much longer ones (~49 ms each on average). Likely cause: the pool opens connections only when needed, so with 90 it keeps opening new ones during the test, and each one waits for the expensive Postgres setup from step 0. Not verified; pre-opening connections (`MinConns`) would test it.
+- **Little's Law check:** Postgres is at ~20% CPU and the queries are fast, so only a few connections are busy at once. More connections can't help, only cost.
+
+**Same sweep near the ceiling (7,000 RPS): inconclusive.** All six sizes failed by 0.6-1.9% (`503`s from the in-flight cap), including size 20, which passed at 7,000 in two other runs. Near the ceiling, run-to-run noise is bigger than the pool-size effect.
 
 **How to read it:**
 - `had_to_wait` counts how many times a request found no free connection and had to wait. `wait_total_ms` is the total time spent waiting.
@@ -132,6 +163,26 @@ done
 - **Little's Law:** connections needed = queries per second × query time. For example, 1,500/s × 2 ms = 3 connections busy on average. Look for where p99 is best.
 
 Then find the ceiling with your best pool size: try 1,500, then 3,000, then halve the gap.
+
+**Recorded 2026-11-06 by Claude** (pool size 20, after the k6 tagging fix, see pitfalls):
+
+| RATE | Runs | Results (p99, errors) | App / Postgres CPU |
+| --- | --- | --- | --- |
+| 2,500 | 1 | ✅ 3.5 ms, 0% | 34% / 23% |
+| 3,000 | 1 | ✅ 9.3 ms, 0% | 37% / 25% |
+| 3,500 | 1 | ✅ 5.8 ms, 0% | 36% / 25% |
+| 4,500 | 1 | ✅ 9.4 ms, 0% | 39% / 30% |
+| 5,500 | 2 | ❌ 376 ms, 1.05% shed · ✅ 2.1 ms, 0% | 39-41% / 27-31% |
+| 6,000 | 3 | ❌ 32 ms, 0.12% shed · ❌ 14 ms, 0.33% shed · ✅ 1.9 ms, 0% | 42-43% / 29-30% |
+| 6,500 | 2 | ✅ 1.8 ms · ✅ 2.0 ms | 45-46% / 30% |
+| 7,000 | 3 | ✅ 1.6 ms · ❌ 170 ms, 1.92% shed (sweep) · ✅ 7.7 ms | 48-51% / 33-40% |
+| 7,500 | 2 | ✅ 7.9 ms · ✅ 1.9 ms | 50% / 33-36% |
+| **8,000** | 1 | ✅ 8.4 ms, 0% | 52% / 37% |
+| 8,500 | 1 | ❌ 14 ms, 0.21% shed | 53% / 40% |
+
+**Step 1 result: the ceiling goes from ~340 to ~8,000 RPS (about 23x).**
+- **The app's CPU is the limit now** (50-53% = its 0.5 CPU quota). Postgres has room to spare (~37%).
+- **Between 5,500 and 7,000, about 1 run in 3 fails by a hair** (0.1-2% `503`s from the in-flight cap, 0 database errors). Something briefly stalls the app and requests pile up past 1,000. At 6,000 RPS the app is only at 42% CPU, so it's not plain CPU saturation. Cause not yet found; CPU-quota pauses (F2) or GC pauses are the suspects.
 
 ---
 
@@ -295,3 +346,4 @@ docker compose exec -T postgres psql -U app -d shop -c \
 - **Switches:** they reset on every `make up`. Check `level3_config` in `make vars`.
 - **CPU budget:** k6 3 + app 0.5 + Postgres 1 + Redis 0.5 = 5 of Docker's 8 CPUs. Stop other projects' containers before testing.
 - **k6 as the limit:** if k6 is near 300% CPU in `make stats`, the test tool is the bottleneck (F8).
+- **k6 "unique time series" warning:** fixed 2026-11-06. k6 tagged each request with its full, unique URL, so its memory grew with every request. Requests are now tagged with the endpoint template. Runs before the fix above ~6,000 RPS aren't reliable.

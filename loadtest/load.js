@@ -91,7 +91,9 @@ export default function () {
   const path = ENDPOINT
     .replace('{id}', pickId())
     .replace('{cat}', `cat-${1 + Math.floor(Math.random() * CATEGORIES)}`);
-  const params = { timeout: '5s', headers: { 'Content-Type': 'application/json' } };
+  // Tag every request with the endpoint template, not its unique URL, or k6
+  // creates a new time series per request and its memory grows without bound.
+  const params = { timeout: '5s', headers: { 'Content-Type': 'application/json' }, tags: { name: ENDPOINT } };
   let res;
   if (METHOD === 'POST') {
     // POST /orders: buy one unit of a (possibly hot) product.

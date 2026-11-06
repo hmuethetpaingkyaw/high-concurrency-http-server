@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-06 · Current level: **3, step 0 recorded (naive ceiling ~340 RPS)** · Next: step 1 (connection pool)
+Last updated: 2026-11-06 · Current level: **3, step 1 done (pool: ~340 → ~8,000 RPS)** · Next: step 2 (query timeouts)
 
 ## 1. Goal and rules
 
@@ -74,6 +74,18 @@ Server protections added in Level 2:
 Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/mutex profiling is still on at rate 1 (some overhead).
 
 ## 4. Test results
+
+### Level 3, step 1: connection pool (2026-11-06)
+
+`DB_POOL=on`. Full tables in [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md#step-1-connection-pool).
+
+| Test | Result |
+| --- | --- |
+| 600 RPS (failed in step 0) | ✅ p99 3.1 ms, 0% errors, **10 connections in total**, Postgres CPU 100% → 13% |
+| Pool size sweep at 1,500 RPS | All pass. Size 2: 20% of requests wait (p99 7.8 ms). **5-20 best** (p99 1.6-2.3 ms). 90: p99 20 ms, long waits (likely new connections opened during load) |
+| Pool size sweep at 7,000 RPS | Inconclusive: all sizes failed by 0.6-1.9% in this batch, noise bigger than the effect |
+| Ceiling (pool 20) | **~8,000 RPS** (8,000 ✅, 8,500 ❌ 0.21% shed). App CPU at its quota (52%), Postgres ~37% |
+| Stability 5,500-7,000 | 5 of 13 runs failed by 0.1-2% `503`s, 0 DB errors (F11) |
 
 ### Level 3, step 0: naive baseline (2026-11-06)
 
@@ -195,17 +207,6 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
   | `time.Sleep(...)` | Yes | No | No |
   | `writeJSON(... requests)` | Yes | Yes (reads `requests`) | No, if the value is saved earlier |
 
-**F9. A new connection per request makes Postgres CPU the ceiling (~340 RPS): OPEN (Level 3, step 1)**
-- Symptom: `/products/{id}` passes at 340 RPS, then collapses at 375: 36% errors, p99 5 s, Postgres CPU at 100% of its 1 CPU. The app sits at ~30% CPU, so it isn't the bottleneck.
-- Cause: every request opens a new connection. Postgres forks a new backend process and checks the password (SCRAM) each time. That costs Postgres ~1.7 ms of CPU per request (50% CPU at 300 RPS), and almost all of it is connection setup, not the query: the list endpoint runs **21 queries** per request and costs about the same Postgres CPU as the 1-query product endpoint (29% vs 27% at 100 RPS).
-- **It's a cliff, not a slope:** Postgres CPU was 57% at 340 RPS but 100% at 375. Once Postgres falls slightly behind, connections take longer, so more are open at once (1-2 jumps to 41-57). Each one is another process competing for the same CPU, so everything slows further: a feedback loop. Near the limit of 100 connections, Postgres starts refusing (`too many clients`) and resetting connections.
-- Fix (step 1): a connection pool. Connections are opened once and reused, so the setup cost disappears and the number of connections is capped.
-
-**F10. Work continues for clients that already gave up: OPEN (Level 3, step 2)**
-- Symptom: in the failing runs, the app completed more queries than successful responses. At 375 RPS, 7,236 queries ran but only 6,225 requests succeeded, so ~1,000 queries finished after k6 had already timed out at 5 s. At 600 RPS: 7,354 vs 6,129.
-- Cause: the naive code uses `context.Background()`, so DB work ignores the client hanging up and has no deadline. During overload, the database spends CPU on answers nobody receives.
-- Fix (step 2): `DB_TIMEOUT` ties DB work to the request's context and adds a deadline.
-
 **F2. Tail latency from CPU throttling: OPEN (smaller at 0.5 CPU)**
 - Symptom: p99 is much higher than p50 even in passing runs (Level 1 at 500 RPS: p50 26 ms, p99 124 ms).
 - Cause: a 0.1 CPU limit lets the app use 10 ms of CPU in every 100 ms window. Once used up, the process waits for the next window, adding up to ~100 ms to unlucky requests.
@@ -255,6 +256,25 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 - Cause: k6 pre-allocated `RATE x 2 / 4` VUs (thousands).
 - Fix: pre-allocate `RATE / 5` VUs (enough for 200 ms latency), grow on demand; k6 budget 3 CPU / 3 GB. A few dropped iterations at the start can still come from VU growth.
 
+**F9. A new connection per request makes Postgres CPU the ceiling (~340 RPS): RESOLVED in Level 3, step 1 (pool: ~8,000 RPS)**
+- Symptom: `/products/{id}` passes at 340 RPS, then collapses at 375: 36% errors, p99 5 s, Postgres CPU at 100% of its 1 CPU. The app sits at ~30% CPU, so it isn't the bottleneck.
+- Cause: every request opens a new connection. Postgres forks a new backend process and checks the password (SCRAM) each time. That costs Postgres ~1.7 ms of CPU per request (50% CPU at 300 RPS), and almost all of it is connection setup, not the query: the list endpoint runs **21 queries** per request and costs about the same Postgres CPU as the 1-query product endpoint (29% vs 27% at 100 RPS).
+- **It's a cliff, not a slope:** Postgres CPU was 57% at 340 RPS but 100% at 375. Once Postgres falls slightly behind, connections take longer, so more are open at once (1-2 jumps to 41-57). Each one is another process competing for the same CPU, so everything slows further: a feedback loop. Near the limit of 100 connections, Postgres starts refusing (`too many clients`) and resetting connections.
+- Fix (step 1): a connection pool. Connections are opened once and reused, so the setup cost disappears and the number of connections is capped.
+
+**F10. Work continues for clients that already gave up: OPEN (Level 3, step 2)**
+- Symptom: in the failing runs, the app completed more queries than successful responses. At 375 RPS, 7,236 queries ran but only 6,225 requests succeeded, so ~1,000 queries finished after k6 had already timed out at 5 s. At 600 RPS: 7,354 vs 6,129.
+- Cause: the naive code uses `context.Background()`, so DB work ignores the client hanging up and has no deadline. During overload, the database spends CPU on answers nobody receives.
+- Fix (step 2): `DB_TIMEOUT` ties DB work to the request's context and adds a deadline.
+
+**F11. Brief stalls near the ceiling make the in-flight cap shed: OPEN (investigate)**
+- Symptom: with the pool on, 5 of 13 runs between 5,500 and 7,000 RPS failed by 0.1-2% `503`s, while repeats at the same or higher rates passed (up to 8,000). 0 database errors.
+- What's known: the `503`s come from the in-flight cap (1,000), so in-flight requests briefly piled up. At 6,000 RPS the app is only at 42% CPU, so it isn't plain CPU saturation.
+- Suspects (not verified): CPU-quota pauses (F2), GC pauses, or activity on the Mac. Next: capture a `go tool trace` or GC stats during a failing run.
+
+**F12. k6 created one time series per unique URL: RESOLVED (tooling)**
+- k6 warned of 800,000+ unique time series: each request's URL is unique (random id + `r=` suffix), so k6's memory grew without bound. Requests are now tagged with the endpoint template (`tags: { name: ENDPOINT }`).
+
 ## 6. Level 3 plan: Postgres + Redis
 
 **Decided 2026-11-06:** add a real Postgres and Redis. Claude implements the code; I run the tests myself with [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md).
@@ -285,6 +305,7 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-06 | 3 (step 1) | Connection pool on (`DB_POOL=on`). k6: tag requests by endpoint template (F12). | `/products/{id}` ceiling ~340 RPS | ~8,000 RPS (app CPU at quota) | Intermittent shedding near the ceiling (F11); no deadlines (F10) |
 | 2026-11-06 | 3 (step 0) | Postgres + Redis added; all fixes behind switches, off by default. Measured the naive baseline. | - | `/products/{id}` ceiling ~340 RPS (375 collapses, Postgres CPU 100%) | Connection per request (F9), no deadlines (F10) |
 | 2026-11-05 | 2 | Load shedding: per-endpoint in-flight caps with immediate `503` + `Retry-After`. `/io` and `/fast` 1,000; `/cpu` = GOMAXPROCS (a cap of 50 failed, F6). pprof moved to internal `:6060`. | `/cpu` 2,000 spike: p99 3.94 s, 10,989 dropped, 209 MiB | `/cpu` 4,000 spike: accepted p99 145 ms, 66% shed, 50 MiB | F7: shedding in front of the server |
 | 2026-11-05 | 2 | Timeouts, header/body limits, Go memory limit from cgroup (90%). | 10k slowloris: OOM-killed | All 10k closed by server, 0% errors | Unbounded in-flight requests |
