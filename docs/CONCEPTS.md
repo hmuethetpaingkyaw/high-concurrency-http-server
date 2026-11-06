@@ -113,7 +113,9 @@ Do not compare them as exact numbers.
 
 What matters: **both point at `ioHandler`**, and both are huge (~230 to ~300 goroutines' worth of waiting).
 
-### 1.6 Other profiles at `http://localhost:8080/debug/pprof/`
+### 1.6 Other profiles at `http://localhost:6060/debug/pprof/`
+
+> Since Level 2, pprof runs on the internal port **6060** (reachable from this Mac only). Level 1 served it on 8080; `localhost:8080/debug/pprof` now returns 404.
 
 | Profile | URL | Use it when |
 | --- | --- | --- |
@@ -129,7 +131,7 @@ What matters: **both point at `ioHandler`**, and both are huge (~230 to ~300 gor
 Quick goroutine check during load (no tools needed):
 
 ```sh
-curl -s 'localhost:8080/debug/pprof/goroutine?debug=1' | head -20
+curl -s 'localhost:6060/debug/pprof/goroutine?debug=1' | head -20
 ```
 
 The first line says `goroutine profile: total N`. Under load at RATE=150, expect around 300.
@@ -148,7 +150,7 @@ make up          (after every code change)
 make load ENDPOINT=/io RATE=150 DURATION=1m
   ... load running ...                   wait ~10 s (let the queue fill)
   ... load running ...                   go tool pprof -top \
-  ... load running ...                     'http://localhost:8080/debug/pprof/block?seconds=20'
+  ... load running ...                     'http://localhost:6060/debug/pprof/block?seconds=20'
   ... load running ...                   (repeat for mutex, goroutine, ...)
 load ends                                read the result
 ```
@@ -158,7 +160,7 @@ Use `DURATION=1m` so the load lasts longer than the 20 s capture.
 To open the web UI instead of `-top`:
 
 ```sh
-go tool pprof -http=:8081 'http://localhost:8080/debug/pprof/block?seconds=20'
+go tool pprof -http=:8081 'http://localhost:6060/debug/pprof/block?seconds=20'
 ```
 
 Pitfalls you already met:

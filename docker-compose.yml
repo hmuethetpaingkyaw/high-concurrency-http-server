@@ -6,13 +6,18 @@ services:
     image: hcs-app:latest
     ports:
       - "8080:8080" # for manual curl only; load tests stay inside the Docker network
+      - "127.0.0.1:6060:6060" # pprof: reachable from this Mac only, like a private network
     environment:
       CPU_ROUNDS: "${CPU_ROUNDS:-5000}"
+      # In-flight caps per endpoint (0 disables shedding). Defaults live in main.go.
+      MAX_INFLIGHT_FAST: "${MAX_INFLIGHT_FAST:-}"
+      MAX_INFLIGHT_IO: "${MAX_INFLIGHT_IO:-}"
+      MAX_INFLIGHT_CPU: "${MAX_INFLIGHT_CPU:-}"
     deploy:
       resources:
         limits:
-          cpus: "${APP_CPUS:-0.1}"   # level 0: a starved t3.nano
-          memory: "${APP_MEM:-128m}"
+          cpus: "${APP_CPUS:-0.5}"   # level 2: half a vCPU (levels 0-1 used 0.1 / 128m)
+          memory: "${APP_MEM:-512m}"
 
   k6:
     image: grafana/k6:1.0.0
@@ -24,5 +29,15 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2" # own budget so the load generator never steals the app's CPU
-          memory: 1g
+          cpus: "3" # own budget so the load generator never steals the app's CPU
+          memory: 3g # spike tests need thousands of virtual users
+
+  slowloris:
+    image: hcs-app:latest # same image as the app; built by `make up`
+    profiles: ["attack"] # only started via `docker compose run slowloris ...`
+    entrypoint: ["/slowloris"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m

@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-03 · Current level: **1 (done, ceiling ~875 RPS)** · Next: Level 2
+Last updated: 2026-11-05 · Current level: **2 (done: survives overload)** · Next: re-baseline the roadmap, then Level 3
 
 ## 1. Goal and rules
 
@@ -8,7 +8,7 @@ Take a Go HTTP server from a real failure at about 100 RPS to 10,000 RPS, fixing
 
 - **Fail first.** Every ceiling comes from a real cause (bugs, CPU quota, memory), never from an artificial rate limiter.
 - **One change per level.** Fix one bottleneck, then re-measure, so every gain has a known cause.
-- **I find the cause, Claude reviews.** Claude gives the symptom and a profiling hint; I diagnose and implement the fix.
+- **I find the cause, Claude reviews.** Claude gives the symptom and a profiling hint; I diagnose and implement the fix. (Levels 1-2: Claude implemented on request and explained each step.)
 - **Every result is logged** here with the exact command and numbers.
 
 **SLO (pass/fail rule).** A level passes at a given RPS only if all three hold for the full test:
@@ -17,7 +17,9 @@ Take a Go HTTP server from a real failure at about 100 RPS to 10,000 RPS, fixing
 | --- | --- | --- |
 | p99 latency | < 200 ms | 99% of requests are fast |
 | Error rate | < 0.1% | Failures, timeouts and resets count |
-| Dropped iterations | 0 | Non-zero means the server was too slow and k6 ran out of virtual users |
+| Dropped iterations | 0 | Non-zero means the server was too slow and k6 ran out of virtual users. A handful at the start can be k6 adding VUs on demand, not the server (see F8) |
+
+**Spike SLO (`make spike`, Level 2+).** Under overload a `503` is the right answer, so spike mode checks: accepted (`200`) p99 < 200 ms, rejected (`503`) p99 < 200 ms, anything else (timeouts, resets, other codes) < 0.1%, 0 dropped. Plus: the container never restarts and memory stays under 70% of the limit.
 
 ## 2. Lab environment
 
@@ -26,8 +28,10 @@ Take a Go HTTP server from a real failure at about 100 RPS to 10,000 RPS, fixing
 | Host | Apple M4, 10 cores (4 performance + 6 efficiency), 16 GB RAM |
 | Docker | Docker Desktop, engine 28.0.4. VM: 8 CPUs / ~15.6 GB. **TODO: reduce to 6 CPUs / 8 GB** |
 | App image | Go 1.25 on distroless, non-root. Go 1.25 sets GOMAXPROCS from the container CPU limit |
-| App limits (Level 0) | 0.1 CPU, 128 MB (a starved t3.nano) |
-| Load generator | k6 1.0.0, own 2-CPU budget, runs inside the Docker network (targets `http://app:8080`) |
+| App limits | Level 2 default: 0.5 CPU, 512 MB. Levels 0-1: 0.1 CPU, 128 MB. GOMAXPROCS = 2 at 0.5 CPU |
+| Load generator | k6 1.0.0, own 3 CPU / 3 GB budget (raised from 2 / 1 GB in Level 2), runs inside the Docker network (targets `http://app:8080`). Tops out around 10,000 RPS on this Mac |
+| Attack tool | `cmd/slowloris` (same image as the app), 0.5 CPU / 256 MB |
+| Other containers | `db` and `sfa_api-localstack-1` from other projects share the Docker VM. Stop them for clean results |
 
 **How to run a test**
 
@@ -35,33 +39,93 @@ Take a Go HTTP server from a real failure at about 100 RPS to 10,000 RPS, fixing
 make up                                       # build and start the app
 make load ENDPOINT=/io RATE=100 DURATION=1m   # hold a fixed rate (pass/fail)
 make ramp ENDPOINT=/io RATE=500               # climb 10 -> 500 RPS to find the ceiling
+make spike ENDPOINT=/cpu RATE=4000 DURATION=30s  # overload test with the spike SLO
+make slowloris CONNS=10000 DURATION=70s       # slow-connection attack (run beside a load test)
 make stats                                    # live CPU and memory per container
-APP_CPUS=0.5 APP_MEM=512m make up             # change app limits for a level
+APP_CPUS=0.1 APP_MEM=128m make up             # change app limits (default 0.5 / 512m)
+MAX_INFLIGHT_IO=0 make up                     # turn load shedding off for an endpoint
+curl -o cpu.pb.gz 'localhost:6060/debug/pprof/profile?seconds=10'   # pprof is on internal port 6060
 ```
 
 **Lab limits.** Apple cores are faster than EC2 vCPUs, so treat ceilings as relative. T-series burst credits and real network latency are not emulated. Docker vCPUs can land on efficiency cores, so expect 10-20% run-to-run noise: run each test twice.
 
-## 3. Current state: Level 1
+## 3. Current state: Level 2
 
-Code: [cmd/server/main.go](../cmd/server/main.go) · Box: 0.1 CPU / 128 MB (unchanged from Level 0)
+Code: [cmd/server/main.go](../cmd/server/main.go) · Box: 0.5 CPU / 512 MB
 
 | Endpoint | Simulates | Status |
 | --- | --- | --- |
-| `/fast` | Cheapest request (counter + JSON) | Fixed in Level 1: atomic counter, no lock |
-| `/io` | 10 ms downstream call (DB, API) | Fixed in Level 1: no lock held while waiting. Now limited by the CPU quota |
-| `/cpu` | CPU-heavy work (5,000 SHA-256 rounds, like password hashing) | No code problem; limited by the CPU quota |
-| `/healthz` | Liveness check | - |
-| `/debug/pprof/*` | Profiling (added in Level 1) | Lab-only: exposed on the public port; move to an internal port in Level 2 |
+| `/fast` | Cheapest request (counter + JSON) | Atomic counter. In-flight cap 1,000 |
+| `/io` | 10 ms downstream call (DB, API) | Ceiling ~8,000 RPS on 0.5 CPU. In-flight cap 1,000 |
+| `/cpu` | CPU-heavy work (5,000 SHA-256 rounds, like password hashing) | ~1,400 accepted RPS on 0.5 CPU. In-flight cap = GOMAXPROCS (2) |
+| `/healthz` | Liveness check | Never shed |
+| `/debug/pprof/*` | Profiling | Internal port `:6060`, published on `127.0.0.1` only. `:8080/debug/pprof` returns 404 |
 
-Server-wide problems still open:
+Server protections added in Level 2:
 
-- No timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`): open to slowloris.
-- No request body or header size limits.
-- No `GOMEMLIMIT`: the GC doesn't know about the 128 MB cap.
-- No limit on in-flight requests: a traffic spike creates unbounded goroutines.
-- No graceful shutdown: SIGTERM kills the process and drops in-flight requests.
+| Protection | Setting | Stops |
+| --- | --- | --- |
+| `ReadHeaderTimeout` / `ReadTimeout` | 5 s / 10 s | Slow clients holding connections (slowloris) |
+| `WriteTimeout` / `IdleTimeout` | 15 s / 60 s | Stuck responses, idle keep-alive connections piling up |
+| `MaxHeaderBytes` / `MaxBytesHandler` | 64 KB / 1 MB | Huge headers and bodies |
+| Go memory limit | 90% of the cgroup limit, read at startup (460 MiB of 512). `GOMEMLIMIT` overrides | GC ignoring the container cap |
+| Per-endpoint in-flight cap (`MAX_INFLIGHT_*`) | Full = immediate `503` + `Retry-After: 1` | Unbounded goroutines, memory and latency under spikes |
+
+Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/mutex profiling is still on at rate 1 (some overhead).
 
 ## 4. Test results
+
+### Level 2 (2026-11-05)
+
+**2a. Failures first (Level 1 code, 0.1 CPU / 128 MB)**
+
+| Test | Result |
+| --- | --- |
+| `/io` spike 3,000 RPS, 30 s | Memory pinned at 127.8 of 128 MiB. 37% timeouts, 39,480 dropped, accepted p99 4.89 s. pprof stopped answering. No OOM kill, but useless |
+| 1,000 slowloris connections + `/io` 300 RPS | Normal traffic passed (p99 116 ms), only 17 MiB used. But the server closed **0 of 1,000** slow connections |
+| 10,000 slowloris connections + `/io` 300 RPS | **OOM-killed** (exit 137) and stayed down (no restart policy). Normal users: 84% failed |
+
+**2b. Bigger box only (0.5 CPU / 512 MB, no protections)**
+
+| Endpoint | RPS | p99 | Dropped | Result |
+| --- | --- | --- | --- | --- |
+| `/io` | 4,000 | 36 ms | 0 | PASS |
+| `/io` | **8,000** | 71 ms | 0 | **PASS (ceiling, app CPU 55% = quota)** |
+| `/io` | 10,000 | 126 ms | 4,929 (1.6%) | FAIL |
+| `/cpu` | 700 | 38 ms | 0 | PASS (app CPU 51%) |
+| `/cpu` spike 2,000 | accepted p99 3.94 s | 10,989 | FAIL: goroutines 4,000, memory 132 -> 209 MiB |
+
+Runs at 6,000-10,000 before the k6 fix (F8) are not valid: k6 was at its memory and CPU limit while the app was at 16-33% CPU.
+
+**2c-2d. Timeouts and memory limit**
+
+| Test | Before | After |
+| --- | --- | --- |
+| 10,000 slowloris + 300 RPS, **0.1 CPU / 128 MB** | OOM-killed, normal users 84% failed | Up, peak 66 MiB, **10,000 of 10,000 closed by server**, 0% errors (p99 244 ms: quota throttling, F2) |
+| 10,000 slowloris + 300 RPS, 0.5 CPU / 512 MB | - | Peak 68 MiB, all 10,000 closed, p99 13 ms |
+| `/io` spike 3,000, 0.1 CPU / 128 MB + memory limit (115 MiB) | 127.8 MiB, 37% timeouts | 115-116 MiB, 25% timeouts. Headroom only; not a fix |
+
+**2e. Load shedding (0.5 CPU / 512 MB)**
+
+| Test | Cap | Accepted p99 | 503 p99 | Shed | Dropped | Peak memory | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `/cpu` spike 2,000 | none | 3.94 s | - | 0% | 10,989 | 209 MiB | FAIL |
+| `/cpu` spike 2,000 | 50 | 3.44 s | 2.67 s | 0.8% | 10,794 | 106 MiB | FAIL: 50 CPU-bound requests at once still eat the whole quota |
+| `/cpu` spike 2,000 | 2 | ~87 ms | ~168 ms | 30% | 0 | 19 MiB | PASS |
+| `/io` spike 10,000 (k6 max, 1.25x ceiling) | 400 | 272 ms | 24 ms (p95) | 3% | 19,212 | 76 MiB | FAIL narrowly |
+| `/io` spike 3,000 on 0.1 CPU / 128 MB | 400 | 4.2 s | 3.96 s | 13.5% | 30,594 | 109 MiB, no OOM | FAIL: box can't even afford to reject (F7) |
+| `/io` normal 6,000 | 400 | 52 ms | - | 0.16% | 0 | - | FAIL (0.16% > 0.1%); raised cap to 1,000 |
+
+**Final Level 2 tests (0.5 CPU / 512 MB, caps: `/io` 1,000, `/cpu` 2)**
+
+| Test | Result | Numbers |
+| --- | --- | --- |
+| T1 normal `/io` 1,000 RPS, 1 min | **PASS** | p99 13 ms, 0 errors, 0 shed |
+| T1b normal `/io` 6,000 RPS, 30 s, ×2 | **PASS** | p99 53 / 38 ms, 0 errors, 0 dropped |
+| T2 spike `/cpu` 4,000 RPS (~3x capacity), 30 s | **PASS*** | accepted p99 145 ms, 503 p99 172 ms, 66% shed, 0 unexpected, peak 50 MiB. *5 of 120,000 dropped: k6 needed 801 VUs with 800 pre-allocated (F8) |
+| T3 10,000 slowloris + `/io` 300 RPS | **PASS** | all 10,000 closed by server, normal p99 12 ms, 0 errors, peak 83 MiB, 2,350 goroutines |
+
+### Levels 0-1
 
 All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%, 0 dropped.
 
@@ -77,8 +141,7 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 | 2026-11-03 | 0 | `/io` | 150 | 40s | 89 | 3.33 s | 3.42 s | 0% | 2,142 | FAIL (re-run before the fix) |
 | 2026-10-31 | 0 | `/io` | 150 | 20s | **~89 (ceiling)** | 3.24 s | 3.43 s | 0% | 917 | FAIL |
 | 2026-10-31 | 0 | `/io` | 80 | 20s | 80 | 12 ms | 111 ms | 0% | 0 | PASS |
-| _pending_ | - | `/fast` | ramp to 3000 | | | | | | | _not measured yet_ |
-| _pending_ | - | `/cpu` | ramp to 300 | | | | | | | _not measured yet_ |
+| _pending_ | - | `/fast` | - | | | | | | | _not measured yet_ |
 
 **Profile at 1000 RPS after the fix (10 s captures):**
 
@@ -114,16 +177,18 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
   | `time.Sleep(...)` | Yes | No | No |
   | `writeJSON(... requests)` | Yes | Yes (reads `requests`) | No, if the value is saved earlier |
 
-**F2. Tail latency from CPU throttling: OPEN**
+**F2. Tail latency from CPU throttling: OPEN (smaller at 0.5 CPU)**
 - Symptom: p99 is much higher than p50 even in passing runs (Level 1 at 500 RPS: p50 26 ms, p99 124 ms).
 - Cause: a 0.1 CPU limit lets the app use 10 ms of CPU in every 100 ms window. Once used up, the process waits for the next window, adding up to ~100 ms to unlucky requests.
 - Not a code bug; it shows the cost of an undersized instance.
+- Level 2: still visible. On 0.5 CPU, `503`s take up to ~170 ms at p99 because the kernel pauses the whole process when the quota runs out. That's why the spike SLO allows 200 ms for `503`s, not 20 ms.
 
-**F3. `/io` ceiling ~875 RPS from the CPU quota: OPEN (next bottleneck)**
+**F3. `/io` ceiling ~875 RPS from the CPU quota: RESOLVED by the bigger box (Level 2)**
 - Symptom: at 1000+ RPS, p99 goes above 500 ms and k6 drops requests; at 2000 RPS, 4.8% of requests fail.
 - Cause: the app uses its full 0.1 CPU (10.7% in `docker stats`, 9% in the CPU profile). The code no longer serializes requests; the box is simply too small.
+- Level 2: on 0.5 CPU the `/io` ceiling is ~8,000 RPS (about 9x, for 5x the CPU: less throttling overhead).
 
-**F4. Memory at 75% of the cap with no protection: OPEN (risk)**
+**F4. Memory at 75% of the cap with no protection: RESOLVED in Level 2 (memory limit + load shedding)**
 - Symptom: 96 MiB of 128 MiB used at 1000 RPS.
 - Risk: under a bigger spike, more in-flight requests means more goroutines and buffers. Without `GOMEMLIMIT` or an in-flight limit, the container can be OOM-killed and drop every request at once.
 - **Investigation (2026-11-03, `/io` spike at 2000 RPS for 30 s, box 0.1 CPU / 128 MB):**
@@ -139,24 +204,35 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
   - **Why it stays high:** Go keeps freed memory for reuse and returns it to the OS slowly. When idle, it only forces a GC every 2 minutes. On top of that, Docker Desktop's kernel (6.10 linuxkit) has transparent huge pages (THP) set to `always`, with `khugepaged/max_ptes_none=511`. The kernel re-packs memory Go has released into 2 MB huge pages, so Docker still counts it. One idle snapshot showed Go's live heap at 3.7 MiB, Go reporting 96 MiB released, and 88 of the process's 92 MiB in huge pages.
   - **Caveat:** the THP-off run had 22.6% errors and ran longer than planned, so its "during" numbers are less comparable. The "150 s after" difference (96 vs 33 MiB) is the clean result.
   - **Fix plan (Level 2):** cap in-flight requests (load shedding) and set `GOMEMLIMIT`. `GODEBUG=disablethp=1` is optional; the real fix is not letting in-flight requests grow without limit.
+- **Result:** `/cpu` spike memory went from 209 MiB to 19-50 MiB; goroutines from 4,000 to ~405.
 
-## 6. Fix plan: Level 2
+**F5. Slow clients hold connections forever (slowloris): RESOLVED in Level 2**
+- Symptom: the server closed 0 of 10,000 slow connections; at 128 MB it was OOM-killed.
+- Fix: `ReadHeaderTimeout` 5 s (plus read/write/idle timeouts). All 10,000 now get cut off.
 
-**Goal:** a bigger box (0.5 CPU / 512 MB) passes the SLO at 1,000 RPS, and a traffic spike far above the ceiling gets fast 503s instead of a crash or timeouts.
+**F6. A concurrency cap of 50 didn't help CPU-bound `/cpu`: RESOLVED in Level 2**
+- Symptom: with cap 50, only 0.8% shed, but `503`s took 2.7 s.
+- Diagnosis: a goroutine dump showed 2,616 goroutines runnable in `readRequest`, waiting for CPU before they could reach the limiter. A CPU profile showed 92% of CPU in `cpuHandler`. With 50 CPU-bound requests running, each got 1/50 of the CPU and the network side starved.
+- Fix: cap CPU-bound work at GOMAXPROCS (2). More in flight than cores adds only queueing. Little's Law sizing works for I/O-bound work, not CPU-bound.
+- Also found: the earlier `/cpu` "ceiling" of 700 RPS was only the highest rate tested. With the cap, it serves ~1,400 accepted RPS.
 
-**Steps (one change at a time, measure after each):**
-1. **Show the failure first.** On the current box, send a spike well above the ceiling (e.g. `make load ENDPOINT=/io RATE=3000 DURATION=30s`) and watch `make stats`. Record memory, errors, and whether the container restarts.
-2. **Bigger box only.** `APP_CPUS=0.5 APP_MEM=512m make up`, then find the new ceiling. This isolates how much the CPU quota alone was costing (F2, F3).
-3. **Server protections:** add read/write/idle timeouts, header and body size limits, and set `GOMEMLIMIT` to about 90% of the memory limit.
-4. **Load shedding:** cap in-flight requests and return a fast `503` when full. Re-run the spike from step 1 and compare.
-5. **Move pprof** to a separate internal port (e.g. `:6060`) that isn't published.
+**F7. In-process shedding can't save a box that can't afford to say no: OPEN (Level 5)**
+- Symptom: `/io` spike at 3,000 RPS on 0.1 CPU still has 27% timeouts with the cap; at 10,000 RPS on 0.5 CPU, 6% dropped.
+- Cause: accepting, parsing and answering a request costs CPU **before** the limiter runs. When arrivals × that cost exceeds the CPU, even `503`s queue up.
+- Fix: shed in front of the server (load balancer / edge rate limit, Level 5) or add capacity.
 
-**Verify:**
-```sh
-APP_CPUS=0.5 APP_MEM=512m make up
-make load ENDPOINT=/io RATE=1000 DURATION=1m   # must PASS
-make load ENDPOINT=/io RATE=3000 DURATION=30s  # spike: fast 503s, no crash, no OOM
-```
+**F8. k6 itself was the bottleneck above 5,000 RPS: RESOLVED (tooling)**
+- Symptom: k6 at 2 GiB / 2 CPU limits while the app used 16-33% CPU.
+- Cause: k6 pre-allocated `RATE x 2 / 4` VUs (thousands).
+- Fix: pre-allocate `RATE / 5` VUs (enough for 200 ms latency), grow on demand; k6 budget 3 CPU / 3 GB. A few dropped iterations at the start can still come from VU growth.
+
+## 6. Next: re-baseline the roadmap
+
+Level 2 changed the picture: on half a vCPU, `/io` already does ~8,000 RPS, close to the original Level 5 target, while the roadmap below assumed much lower numbers. Before Level 3, agree on new targets. Questions to settle:
+
+1. Should `/io` stay this cheap, or should it simulate a realistic downstream (variable latency, occasional slow calls)? A real DB or Redis (the original Level 3) would do that.
+2. Should the box shrink back (e.g. 0.25 CPU) so later levels have something left to fix before 10k?
+3. Where should 10k RPS be proven: one instance, or several behind a load balancer (Level 5), which is also where F7 gets fixed?
 
 ## 7. Level roadmap
 
@@ -164,13 +240,13 @@ make load ENDPOINT=/io RATE=3000 DURATION=30s  # spike: fast 503s, no crash, no 
 | --- | --- | --- | --- | --- |
 | 0 | 0.1 / 128 MB | ~100 RPS (fails) | Global lock, CPU throttling | Baseline, profiling with pprof |
 | 1 | 0.1 / 128 MB | 500 (reached ~875) | Lock held during I/O | Narrow critical sections, atomics |
-| 2 | 0.5 / 512 MB | 1,000 | Unbounded goroutines and memory under spikes | Timeouts, size limits, GOMEMLIMIT, bounded concurrency, load shedding (fast 503) |
+| 2 | 0.5 / 512 MB | 1,000 (reached: `/io` ceiling ~8,000; survives 3x `/cpu` spike and 10k slowloris) | Unbounded goroutines and memory under spikes | Timeouts, size limits, GOMEMLIMIT, bounded concurrency, load shedding (fast 503) |
 | 3 | 0.5 / 512 MB | 2,500 | Slow dependency calls | Caching, connection reuse (DB/Redis added here) |
 | 4 | 1 / 1 GB | 5,000 | GC pressure from allocations | Allocation profiling, sync.Pool, cheaper JSON |
 | 5 | 3 × (1 / 1 GB) + nginx | 8,000 | A single instance's limit | Horizontal scaling, load balancer, upstream keep-alive |
 | 6 | 3 × (1 / 1 GB) + nginx | 10,000, 0 errors during redeploys | Dropped requests on shutdown | Graceful shutdown, readiness draining |
 
-`/cpu` at 10k RPS would need ~10 full cores. It will hit the hardware limit first, so its target is set separately once measured.
+`/cpu` at 10k RPS would need ~3.5 full cores (measured ~1,400 RPS per 0.5 CPU). It will hit the hardware limit first, so its target is set separately. Levels 3-6 targets are under review (section 6).
 
 ## 8. Change log
 
@@ -178,6 +254,9 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-05 | 2 | Load shedding: per-endpoint in-flight caps with immediate `503` + `Retry-After`. `/io` and `/fast` 1,000; `/cpu` = GOMAXPROCS (a cap of 50 failed, F6). pprof moved to internal `:6060`. | `/cpu` 2,000 spike: p99 3.94 s, 10,989 dropped, 209 MiB | `/cpu` 4,000 spike: accepted p99 145 ms, 66% shed, 50 MiB | F7: shedding in front of the server |
+| 2026-11-05 | 2 | Timeouts, header/body limits, Go memory limit from cgroup (90%). | 10k slowloris: OOM-killed | All 10k closed by server, 0% errors | Unbounded in-flight requests |
+| 2026-11-05 | 2 | Bigger box: 0.5 CPU / 512 MB. Tooling: `make spike` (spike SLO), `cmd/slowloris`, k6 VU pre-allocation fix and 3 CPU / 3 GB budget. | `/io` ceiling ~875 RPS (0.1 CPU) | `/io` ceiling ~8,000 RPS | Overload protection |
 | 2026-11-03 | 1 | Fixed F1: replaced the global mutex with `atomic.Int64`; each handler reads the counter once and never holds anything during I/O. | `/io` ceiling ~89 RPS | `/io` ceiling ~875 RPS (1000 fails) | CPU quota (F3), memory headroom (F4) |
 | 2026-11-03 | 1 | Added pprof profiling (`net/http/pprof`, block and mutex rates = 1). Profiles confirm F1. Pitfalls hit: stale container served 404 (rebuild with `make up`), Graphviz missing, port 9090 in use. | - | - | - |
 | 2026-10-31 | 0 | Lab created: naive server, EC2-sized compose limits, k6 open-model test, Makefile. Worked around a Compose v2 panic on `run -e` (k6 service needs an `environment:` block). | - | `/io` ceiling ~89 RPS | Global lock on `/io` (F1) |
