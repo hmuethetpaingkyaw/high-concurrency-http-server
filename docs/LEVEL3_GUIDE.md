@@ -388,8 +388,17 @@ make vars | grep -E "db_queries|singleflight"
 
 | `SINGLEFLIGHT` | `db_queries` in 30 s | Queries per expiry (÷ 30) | p99 |
 | --- | --- | --- | --- |
-| off | | | |
-| on | | | |
+| off | 225 | 7.5 | 4.24 ms |
+| on | 30 | 1.0 | 1.09 ms |
+
+Measured on 2026-11-09 with `DB_POOL=on DB_TIMEOUT=300ms LIST_QUERY=join CACHE=on CACHE_TTL=1s`, `ENDPOINT='/products/{id}' RATE=3000 DURATION=30s HOT_KEYS=1 HOT_RATIO=1`, Redis flushed before each run. Both runs: 0 errors, 0 dropped, all pass (p99 < 200 ms).
+
+| Run | Requests | `cache_hits` + `cache_misses` | `singleflight_shared` |
+| --- | --- | --- | --- |
+| off | 90,016 | 89,791 + 225 = 90,016 | 0 |
+| on | 90,001 | 89,846 + 155 = 90,001 | 149 |
+
+Curl smoke check (300 parallel requests for `/products/9`, cold cache): `db_queries` rose by **300** with singleflight off (300 misses) and by **1** with it on (297 hits, 3 misses, `singleflight_shared` 3).
 
 ---
 

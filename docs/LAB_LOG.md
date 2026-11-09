@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-09 · Current level: **3, step 3 done (join: list ceiling ~750 → ~1,500 RPS)** · Next: step 4 (Redis cache)
+Last updated: 2026-11-09 · Current level: **3 finished** (steps 0-5; `/products/{id}` target 5,000 RPS met with cache) · Open: 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
 
 ## 1. Goal and rules
 
@@ -74,6 +74,25 @@ Server protections added in Level 2:
 Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/mutex profiling is still on at rate 1 (some overhead).
 
 ## 4. Test results
+
+### Level 3, step 5: singleflight on a cache stampede (2026-11-09)
+
+`DB_POOL=on DB_TIMEOUT=300ms LIST_QUERY=join CACHE=on CACHE_TTL=1s`, one hot key (`HOT_KEYS=1 HOT_RATIO=1`), 3,000 RPS for 30 s. Redis flushed before each run, app restarted before each run. Full tables in [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md#step-5-cache-stampede-and-singleflight).
+
+| | `SINGLEFLIGHT=off` | `SINGLEFLIGHT=on` |
+| --- | --- | --- |
+| Requests (k6) | 90,016 | 90,001 |
+| `db_queries` in 30 s | 225 | **30** |
+| Queries per expiry | 7.5 | **1.0** |
+| p99 at 3,000 RPS | 4.24 ms | 1.09 ms |
+| Errors / dropped | 0 / 0 | 0 / 0 |
+| `cache_hits` + `cache_misses` | 89,791 + 225 = 90,016 | 89,846 + 155 = 90,001 |
+| `singleflight_shared` | 0 | 149 |
+| Pass (SLO) | ✅ | ✅ |
+
+Curl smoke check (300 parallel requests, one cold key): **300 DB queries** off, **1** on.
+
+The stampede is small here: a DB load takes about 0.3 ms, so only a few requests arrive during each miss window (225 misses over 30 expiries with singleflight off, not 300 per expiry). The 300-request curl burst shows the effect more clearly. `singleflight_shared` counts every caller that joined a shared load, including the leader when others joined it, so it doesn't equal the number of followers. Both runs' counters add up. Not tested: stampedes at ceiling rates or with several hot keys.
 
 ### Level 3, step 4: Redis cache-aside on `GET /products/{id}` (2026-11-09)
 
@@ -331,7 +350,13 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 - `EXPLAIN ANALYZE`: Postgres walks the primary key and filters out ~936 rows from other categories to find 20, then merges ~956 inventory rows. That's most of the ~0.4 ms of Postgres CPU per request left after step 3.
 - Options: caching (step 4), or make the planner use the category index (for example, with better statistics or a different index). Not measured yet.
 
+**F15. `/products/{id}` with the cache on fails at 8,000 RPS: OPEN (cause not identified)**
+- Symptom: 0.14% failed (699 of 479,891) and 110 dropped at 8,000 RPS, p99 53.9 ms. Postgres is at 8% CPU at 5,000, so the database isn't the limit.
+- Unknown: the k6 output doesn't break failures down by status code. Next: rerun at 8,000 with the status code in the check, or check `/debug/vars` for shedding (`503`) vs timeouts.
+
 ## 6. Level 3 plan: Postgres + Redis
+
+**Status (2026-11-09): finished.** Steps 0-5 measured and recorded. Target met: `GET /products/{id}` passes the SLO at 5,000 RPS with the cache on (Postgres 8% CPU). Not run: the optional hot-row lock bonus. Open: F14, F15.
 
 **Decided 2026-11-06:** add a real Postgres and Redis. Claude implements the code; I run the tests myself with [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md).
 
@@ -348,7 +373,7 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 | 0 | 0.1 / 128 MB | ~100 RPS (fails) | Global lock, CPU throttling | Baseline, profiling with pprof |
 | 1 | 0.1 / 128 MB | 500 (reached ~875) | Lock held during I/O | Narrow critical sections, atomics |
 | 2 | 0.5 / 512 MB | 1,000 (reached: `/io` ceiling ~8,000; survives 3x `/cpu` spike and 10k slowloris) | Unbounded goroutines and memory under spikes | Timeouts, size limits, GOMEMLIMIT, bounded concurrency, load shedding (fast 503) |
-| 3 | app 0.5 / 512 MB + Postgres 1 / 1 GB + Redis 0.5 / 256 MB | `GET /products/{id}` 5,000 | Connection churn, no timeouts, N+1, no cache, stampedes | Pooling, timeouts, joins, cache-aside, singleflight |
+| 3 | app 0.5 / 512 MB + Postgres 1 / 1 GB + Redis 0.5 / 256 MB | `GET /products/{id}` 5,000 (**reached: 5,000 with cache**) | Connection churn, no timeouts, N+1, no cache, stampedes | Pooling, timeouts, joins, cache-aside, singleflight |
 | 4 | 0.5 / 512 MB | CPU per request down | GC pressure from allocations | Allocation profiling, sync.Pool, cheaper JSON |
 | 5 | 3 app instances + load balancer | 10,000 | A single instance's limit; F7 | Horizontal scaling, load balancer, shedding at the edge |
 | 6 | same as 5 | 10,000, 0 errors during redeploys | Dropped requests on shutdown | Graceful shutdown, readiness draining |
@@ -361,6 +386,8 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-09 | 3 (step 5) | Measured `SINGLEFLIGHT=on` vs off on a cache stampede (one hot key, 1 s TTL, 3,000 RPS), and a 300-request burst on one cold key. | Burst: 300 DB queries; stampede: 7.5 loads per expiry, p99 4.2 ms | Burst: **1** DB query; stampede: **1.0** per expiry, p99 1.1 ms | Hot-row lock on orders (bonus, not run); stampedes at higher rates not tested |
+| 2026-11-09 | 3 (step 4) | Measured the Redis cache-aside path (`CACHE=on`, no code change). | Every read hits Postgres; Postgres 37% CPU at the step 1 ceiling | Cache ceiling **~5,000 RPS** (hit ratio 82% at `HOT_RATIO` 0.8, 41% uniform, 98% at 0.99); Postgres 8% at 5,000 | 8,000 RPS failure (F15); hit ratio depends on skew |
 | 2026-11-09 | 3 (step 3) | Measured `LIST_QUERY=join` vs N+1 on the list endpoint (no code change; the switch already existed). | List: 21 queries per request, ceiling ~750 RPS (pool held for 21 round trips) | 1 query, ceiling ~1,500 RPS, p99 at 300 RPS 13.2 → 3.6 ms | Postgres CPU; list query plan (F14); Redis cache (step 4) |
 | 2026-11-06 | 3 (step 2) | Measured `DB_TIMEOUT=300ms` vs none during a 10 s DB freeze (no code change). | Freeze: requests hang up to 10 s, 1,613 goroutines, 1,247 dropped | `504` in 0.30 s, 210 goroutines, 35 dropped | N+1 list query (step 3) |
 | 2026-11-06 | 3 (step 1) | Connection pool on (`DB_POOL=on`). k6: tag requests by endpoint template (F12). | `/products/{id}` ceiling ~340 RPS | ~8,000 RPS (app CPU at quota) | Intermittent shedding near the ceiling (F11); no deadlines (F10) |
