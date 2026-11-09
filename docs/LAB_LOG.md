@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-06 · Current level: **3, step 2 done (timeouts bound a DB outage)** · Next: step 3 (N+1 vs join)
+Last updated: 2026-11-09 · Current level: **3, step 3 done (join: list ceiling ~750 → ~1,500 RPS)** · Next: step 4 (Redis cache)
 
 ## 1. Goal and rules
 
@@ -74,6 +74,18 @@ Server protections added in Level 2:
 Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/mutex profiling is still on at rate 1 (some overhead).
 
 ## 4. Test results
+
+### Level 3, step 3: N+1 vs join on the list endpoint (2026-11-09)
+
+`DB_POOL=on DB_TIMEOUT=300ms`, pool max 10, `GET /products?category={cat}`, 20 items per page. Full tables in [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md#step-3-fix-n1).
+
+| | `LIST_QUERY=n+1` | `LIST_QUERY=join` |
+| --- | --- | --- |
+| Queries per request | 21 | **1** |
+| 300 RPS: p99 / Postgres CPU / connections | 13.2 ms / 21% / 10 | **3.6 ms / 14% / 4** |
+| Postgres CPU per request | ~0.7-0.8 ms | ~0.36-0.47 ms |
+| Ceiling | **~750 RPS** (900 ❌ 6.9% `504`) | **~1,500 RPS** (1,750 ❌ 37% `504`) |
+| Limit | pool: connections held for 21 round trips (Postgres 71%) | Postgres CPU (102% at 2,000) |
 
 ### Level 3, step 2: query timeouts under a frozen database (2026-11-06)
 
@@ -289,6 +301,16 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 **F12. k6 created one time series per unique URL: RESOLVED (tooling)**
 - k6 warned of 800,000+ unique time series: each request's URL is unique (random id + `r=` suffix), so k6's memory grew without bound. Requests are now tagged with the endpoint template (`tags: { name: ENDPOINT }`).
 
+**F13. N+1 queries hold a pooled connection for 21 round trips: RESOLVED in Level 3, step 3 (`LIST_QUERY=join`)**
+- Symptom: the list endpoint fails at 900 RPS with `504`s and pool waits while Postgres is only at 71% CPU.
+- Cause: one request runs 21 queries in a row on the same connection, so each connection serves fewer requests per second. With 10 connections the pool runs out first (Little's Law: throughput ≤ connections ÷ hold time).
+- Fix: one query with a join. Ceiling ~750 → ~1,500 RPS; p99 at 300 RPS 13.2 → 3.6 ms. Postgres CPU per request only halves (fixed per-statement overhead), so Postgres CPU is now the limit.
+- Both versions collapse suddenly: timed-out connections are discarded and reopened (step 2), which adds Postgres CPU when it's already short.
+
+**F14. The list query doesn't use the `(category, id)` index: OPEN (observed, not fixed)**
+- `EXPLAIN ANALYZE`: Postgres walks the primary key and filters out ~936 rows from other categories to find 20, then merges ~956 inventory rows. That's most of the ~0.4 ms of Postgres CPU per request left after step 3.
+- Options: caching (step 4), or make the planner use the category index (for example, with better statistics or a different index). Not measured yet.
+
 ## 6. Level 3 plan: Postgres + Redis
 
 **Decided 2026-11-06:** add a real Postgres and Redis. Claude implements the code; I run the tests myself with [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md).
@@ -319,6 +341,7 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-09 | 3 (step 3) | Measured `LIST_QUERY=join` vs N+1 on the list endpoint (no code change; the switch already existed). | List: 21 queries per request, ceiling ~750 RPS (pool held for 21 round trips) | 1 query, ceiling ~1,500 RPS, p99 at 300 RPS 13.2 → 3.6 ms | Postgres CPU; list query plan (F14); Redis cache (step 4) |
 | 2026-11-06 | 3 (step 2) | Measured `DB_TIMEOUT=300ms` vs none during a 10 s DB freeze (no code change). | Freeze: requests hang up to 10 s, 1,613 goroutines, 1,247 dropped | `504` in 0.30 s, 210 goroutines, 35 dropped | N+1 list query (step 3) |
 | 2026-11-06 | 3 (step 1) | Connection pool on (`DB_POOL=on`). k6: tag requests by endpoint template (F12). | `/products/{id}` ceiling ~340 RPS | ~8,000 RPS (app CPU at quota) | Intermittent shedding near the ceiling (F11); no deadlines (F10) |
 | 2026-11-06 | 3 (step 0) | Postgres + Redis added; all fixes behind switches, off by default. Measured the naive baseline. | - | `/products/{id}` ceiling ~340 RPS (375 collapses, Postgres CPU 100%) | Connection per request (F9), no deadlines (F10) |

@@ -267,12 +267,41 @@ make load ENDPOINT='/products?category={cat}' RATE=300 DURATION=30s
 make vars | grep db_queries
 ```
 
-| `LIST_QUERY` | Queries per request (`db_queries` ÷ requests) | p99 | Postgres CPU | Ceiling |
-| --- | --- | --- | --- | --- |
-| n+1 | | | | |
-| join | | | | |
+### Recorded results (2026-11-09)
 
-**Question:** each extra query is a network round trip plus work for Postgres. How much of the difference is round trips, and how much is Postgres CPU?
+`DB_POOL=on DB_TIMEOUT=300ms`, pool max 10, `GET /products?category={cat}` (20 items per page), 30 s per run. CPU is the average while k6 runs.
+
+**Same load, 300 RPS:**
+
+| `LIST_QUERY` | Queries per request (`db_queries` ÷ requests) | avg / p99 | Postgres CPU | Postgres CPU per request | Connections used |
+| --- | --- | --- | --- | --- | --- |
+| n+1 | **21** (189,021 ÷ 9,001) | 2.23 ms / 13.2 ms | 21% | ~0.70 ms | 10 (34 waits) |
+| join | **1** (9,001 ÷ 9,001) | 0.82 ms / **3.6 ms** | 14% | ~0.47 ms | **4** (4 waits) |
+
+**Ceiling sweep:**
+
+| `LIST_QUERY` | RPS | Result | p99 | App / Postgres CPU | Pool |
+| --- | --- | --- | --- | --- | --- |
+| n+1 | 600 | ✅ | 15.2 ms | 37% / 49% | 166 waits |
+| n+1 | **750** | ✅ | 27.5 ms | 46% / 60% | 679 waits |
+| n+1 | 900 | ❌ 6.9% `504`, 310 dropped | 303 ms | 47% / **71%** | 7,094 waits; timed-out connections thrown away |
+| n+1 | 1,200 | ❌ 83% `504` | 307 ms | 37% / 107% | every acquire waited |
+| join | **1,500** | ✅ | 10.6 ms | 22% / 54% | 634 waits |
+| join | 1,750 | ❌ 37% `504`, 2,668 dropped | 859 ms | 35% / 75% | 4,839 waits |
+| join | 2,000 | ❌ 69% `504` | 485 ms | 37% / **102%** | |
+| join | 3,000 | ❌ 92% `504` | 811 ms | 49% / 103% | |
+
+| `LIST_QUERY` | Queries per request | p99 at 300 RPS | Postgres CPU per request | Ceiling | What runs out first |
+| --- | --- | --- | --- | --- | --- |
+| n+1 | 21 | 13.2 ms | ~0.7-0.8 ms | **~750 RPS** | **the pool**: each request holds a connection for 21 round trips (Postgres only at 71% when it fails) |
+| join | 1 | 3.6 ms | ~0.36-0.47 ms | **~1,500 RPS** (2×) | **Postgres CPU** (102% at 2,000) |
+
+**Answer to the question (round trips vs Postgres CPU):**
+- **Round trips decide latency and the N+1 ceiling.** A request holds its pooled connection for all 21 queries, about 1.4 ms more than one join at low load (~0.07 ms per extra round trip), and much more once Postgres gets busy. With 10 connections, Little's Law caps throughput at 10 ÷ hold time. N+1 hit that wall at ~900 RPS while Postgres still had ~30% CPU spare.
+- **Postgres CPU only halves.** Every statement has fixed overhead (parse/bind/execute, a reply), so 21 tiny queries cost ~2× the CPU of one join. So the join's ceiling is 2×, not 21×, and now Postgres CPU is the limit.
+- **The collapse feeds itself.** Once requests time out, pgx throws those connections away (step 2), and reopening them costs Postgres more CPU, exactly when it has none to spare. That's why both versions fall off a cliff (✅ at 1,500, 37% failed at 1,750) instead of degrading slowly.
+
+**Observation for later (not fixed in this step):** `EXPLAIN ANALYZE` shows the list query doesn't use the `(category, id)` index. It walks the primary key and throws away ~936 rows from other categories to find 20 (categories are spread evenly across ids). The join then merges ~956 inventory rows. That's the main cost left per request, and step 4's cache is the next lever.
 
 ---
 
