@@ -325,9 +325,29 @@ make load ENDPOINT='/products/{id}' RATE=3000 DURATION=60s HOT_RATIO=0.99   # ve
 
 | `HOT_RATIO` | RATE | Hit ratio | p99 | Postgres CPU | Pass? |
 | --- | --- | --- | --- | --- | --- |
-| 0 | 3000 | | | | |
-| 0.8 | 3000 | | | | |
-| 0.99 | 3000 | | | | |
+| 0 | 3000 | 40.9% | 5.52 ms | 13% | ✅ |
+| 0.8 | 3000 | 81.6% | 0.94 ms | 5% | ✅ |
+| 0.99 | 3000 | 97.9% | 1.16 ms | 1% | ✅ |
+
+Recorded 2026-11-09: `DB_POOL=on DB_TIMEOUT=300ms LIST_QUERY=join CACHE=on`, Redis `FLUSHALL` and app restart before each run, 60 s per run. Hit ratio = `cache_hits` ÷ (`cache_hits` + `cache_misses`). `cache_hits` + `cache_misses` equals the request count in every run. Postgres CPU is the average while k6 runs.
+
+| `HOT_RATIO` | RATE | Hits / misses | Postgres queries (= misses) | Hit ratio |
+| --- | --- | --- | --- | --- |
+| 0 | 3000 | 73,583 / 106,415 | 106,415 | 40.9% |
+| 0.8 | 3000 | 146,913 / 33,090 | 33,090 | 81.6% (first run: 81.5%, p99 2.57 ms) |
+| 0.99 | 3000 | 176,241 / 3,760 | 3,760 | 97.9% |
+
+**Ceiling sweep (`HOT_RATIO=0.8`):**
+
+| RATE | Achieved | Result | p99 | Hit ratio | App / Postgres CPU |
+| --- | --- | --- | --- | --- | --- |
+| 1,500 | 1,500 | ✅ 0% errors, 0 dropped | 2.18 ms | 79.0% | 25% / 7% |
+| 3,000 | 3,000 | ✅ 0% errors, 0 dropped | 2.57 ms | 81.5% | 34% / 7% |
+| 5,000 | 4,998 | ✅ 0% errors, 0 dropped | 10.6 ms | 83.2% | 40% / 8% |
+| 8,000 | 7,997 | ❌ 0.14% errors (699 of 479,891), 110 dropped | 53.9 ms | 84.8% | 53% / 9% |
+
+**Ceiling for the cache-on path: 5,000 RPS** (the Level 3 target). 8,000 failed the SLO, so the sweep stopped there.
+
 
 **Check invalidation:** an order should remove the cached product, so the next read shows the new stock:
 ```sh

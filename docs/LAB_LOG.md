@@ -75,6 +75,26 @@ Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/m
 
 ## 4. Test results
 
+### Level 3, step 4: Redis cache-aside on `GET /products/{id}` (2026-11-09)
+
+`DB_POOL=on DB_TIMEOUT=300ms LIST_QUERY=join CACHE=on`. Redis flushed and app restarted before each run, 60 s per run. Full tables in [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md#step-4-redis-cache).
+
+| | `HOT_RATIO` 0 | `HOT_RATIO` 0.8 | `HOT_RATIO` 0.99 |
+| --- | --- | --- | --- |
+| Hit ratio at 3,000 RPS | 40.9% | 81.6% | **97.9%** |
+| p99 at 3,000 RPS | 5.52 ms | 0.94 ms | 1.16 ms |
+| Postgres CPU at 3,000 RPS | 13% | 5% | 1% |
+| Postgres queries (= misses) | 106,415 | 33,090 | 3,760 |
+| Pass (SLO) at 3,000 RPS | ✅ | ✅ | ✅ |
+
+| Ceiling (`HOT_RATIO` 0.8) | Result |
+| --- | --- |
+| 1,500 / 3,000 | ✅ p99 2.2 / 2.6 ms, 0 errors |
+| **5,000** | ✅ 4,998 achieved, p99 10.6 ms, 0 errors, 0 dropped, Postgres 8% |
+| 8,000 | ❌ 0.14% errors (699 of 479,891), 110 dropped, p99 53.9 ms |
+
+Ceiling on the cache-on path: **~5,000 RPS** (the Level 3 target). Hit ratio rises with skew: 79% at 1,500 RPS with `HOT_RATIO` 0.8, 83% at 5,000. `cache_hits` + `cache_misses` matched the request count in every run. The 8,000 failure is not broken down by status code in these outputs, and the cause is not identified yet.
+
 ### Level 3, step 3: N+1 vs join on the list endpoint (2026-11-09)
 
 `DB_POOL=on DB_TIMEOUT=300ms`, pool max 10, `GET /products?category={cat}`, 20 items per page. Full tables in [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md#step-3-fix-n1).
