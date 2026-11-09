@@ -227,12 +227,31 @@ make db-freeze FREEZE=10
 - `db_timeouts`
 - How quickly things recover after the unfreeze
 
+**Recorded 2026-11-06 by Claude.** `DB_POOL=on` (max 10), 300 RPS for 60 s, Postgres frozen from t=15 s to t=25-26 s. A probe request every 0.25 s and a once-a-second timeline ran beside k6.
+
 | Case | Errors | Status codes during the freeze | Peak goroutines | Peak memory | Time to recover |
 | --- | --- | --- | --- | --- | --- |
-| A: no timeout | | | | | |
-| B: `DB_TIMEOUT=300ms` | | | | | |
+| A: no timeout | 8.6% (1,436, all k6 5 s timeouts) + **1,247 dropped** | none: requests just hang (probe: one request took **9.9 s**, then `200`) | **1,613** (65 before) | **~40 MiB** (10 before; still ~40 after) | immediate after unfreeze |
+| B: `DB_TIMEOUT=300ms` | 16.2% (2,902 `504`s; `db_timeouts` 2,915 incl. the probe's 13) + 35 dropped | `504` after **0.30 s** (all 13 probe failures took 0.302-0.304 s) | **210** | **12.8 MiB** | immediate after unfreeze |
 
-**What to understand:** without a timeout, requests wait until the database returns, and the in-flight cap (`MAX_INFLIGHT_DB`) fills up. With a timeout, users get a quick `504` and the server stays light. The naive code also uses `context.Background()`, so DB work continues even after the client has hung up.
+| More detail | A: no timeout | B: 300 ms timeout |
+| --- | --- | --- |
+| k6 virtual users needed | **600** (its maximum, RATE × 2) | 94 |
+| Successful requests: avg / max | 90 ms / **4.99 s** | 1.6 ms / 0.30 s |
+| p95, all requests | 3.81 s | 0.30 s |
+| Pool during the freeze (repeat with a warm pool, sampled every 0.5 s) | all 10 in use, 0 idle; the same 10 connections wait, then finish (`db_connects` stays 10) | all 10 in use, 0 idle; timed-out connections are thrown away (`db_connects` 10 → **22** right after the unfreeze: 12 new connections) |
+| `db_errors` | 0 | 0 |
+
+**What to understand:**
+- **Why A shows *fewer* errors (8.6%) than B (16.2%), yet A is worse:**
+  - B fails every request during the freeze, quickly and honestly.
+  - In A, requests that arrived in the last ~5 s of the freeze waited until Postgres came back, and then counted as "successes" taking up to 5 s.
+  - In A, 1,247 requests were never sent at all, because all 600 of k6's users were stuck waiting.
+- **The timeout caps the pile-up.** In flight = 300/s × 0.3 s ≈ 90, so k6 needed 94 users, and goroutines stayed at ~210. Without it, everything waits for the whole outage: goroutines 65 → 1,613, memory 10 → 40 MiB. k6's 600-user limit capped Case A. Real clients have no such limit, so in production the pile-up would keep growing until the in-flight cap (`MAX_INFLIGHT_DB`, 1,000) starts shedding.
+- **Recovery was immediate in both cases** at this rate: 10 pool connections drained the backlog within a second.
+- **The pool is full during the freeze in both cases.** Every request that needs the database has to wait for a free connection, even ones that would be fast. The timeout limits that wait to 300 ms; it doesn't free a connection.
+- **With a timeout, connections are thrown away.** When pgx gives up on a query halfway, it can't trust the connection anymore (Postgres might still send the old answer later), so it closes it. Right after the database came back, the pool opened 12 new connections, each with the expensive setup from step 0. With 10 connections that's cheap; with many app instances it becomes a reconnect storm aimed at a database that has only just recovered.
+- The naive code also uses `context.Background()`, so DB work continues even after the client has hung up (F10).
 
 ---
 

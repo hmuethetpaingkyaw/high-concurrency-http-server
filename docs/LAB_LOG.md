@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-06 · Current level: **3, step 1 done (pool: ~340 → ~8,000 RPS)** · Next: step 2 (query timeouts)
+Last updated: 2026-11-06 · Current level: **3, step 2 done (timeouts bound a DB outage)** · Next: step 3 (N+1 vs join)
 
 ## 1. Goal and rules
 
@@ -74,6 +74,18 @@ Server protections added in Level 2:
 Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/mutex profiling is still on at rate 1 (some overhead).
 
 ## 4. Test results
+
+### Level 3, step 2: query timeouts under a frozen database (2026-11-06)
+
+`DB_POOL=on`, 300 RPS for 60 s, Postgres frozen for 10 s (`docker compose pause`). Full tables in [LEVEL3_GUIDE.md](LEVEL3_GUIDE.md#step-2-query-timeouts-a-stuck-database).
+
+| | A: no timeout | B: `DB_TIMEOUT=300ms` |
+| --- | --- | --- |
+| During the freeze | requests hang (probe: 9.9 s) | `504` after 0.30 s |
+| Errors / dropped | 8.6% (5 s timeouts) / **1,247** | 16.2% (`504`) / 35 |
+| Peak goroutines / memory | **1,613 / ~40 MiB** | **210 / 12.8 MiB** |
+| k6 users needed | 600 (its max) | 94 |
+| Recovery after unfreeze | immediate | immediate |
 
 ### Level 3, step 1: connection pool (2026-11-06)
 
@@ -263,10 +275,11 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 - **It's a cliff, not a slope:** Postgres CPU was 57% at 340 RPS but 100% at 375. Once Postgres falls slightly behind, connections take longer, so more are open at once (1-2 jumps to 41-57). Each one is another process competing for the same CPU, so everything slows further: a feedback loop. Near the limit of 100 connections, Postgres starts refusing (`too many clients`) and resetting connections.
 - Fix (step 1): a connection pool. Connections are opened once and reused, so the setup cost disappears and the number of connections is capped.
 
-**F10. Work continues for clients that already gave up: OPEN (Level 3, step 2)**
+**F10. Work continues for clients that already gave up: RESOLVED in Level 3, step 2 (`DB_TIMEOUT`)**
 - Symptom: in the failing runs, the app completed more queries than successful responses. At 375 RPS, 7,236 queries ran but only 6,225 requests succeeded, so ~1,000 queries finished after k6 had already timed out at 5 s. At 600 RPS: 7,354 vs 6,129.
 - Cause: the naive code uses `context.Background()`, so DB work ignores the client hanging up and has no deadline. During overload, the database spends CPU on answers nobody receives.
 - Fix (step 2): `DB_TIMEOUT` ties DB work to the request's context and adds a deadline.
+- Result: during a 10 s database freeze, failed requests end after 0.30 s with `504`; goroutines stay at ~210 instead of 1,613, memory at 12.8 instead of ~40 MiB.
 
 **F11. Brief stalls near the ceiling make the in-flight cap shed: OPEN (investigate)**
 - Symptom: with the pool on, 5 of 13 runs between 5,500 and 7,000 RPS failed by 0.1-2% `503`s, while repeats at the same or higher rates passed (up to 8,000). 0 database errors.
@@ -306,6 +319,7 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-06 | 3 (step 2) | Measured `DB_TIMEOUT=300ms` vs none during a 10 s DB freeze (no code change). | Freeze: requests hang up to 10 s, 1,613 goroutines, 1,247 dropped | `504` in 0.30 s, 210 goroutines, 35 dropped | N+1 list query (step 3) |
 | 2026-11-06 | 3 (step 1) | Connection pool on (`DB_POOL=on`). k6: tag requests by endpoint template (F12). | `/products/{id}` ceiling ~340 RPS | ~8,000 RPS (app CPU at quota) | Intermittent shedding near the ceiling (F11); no deadlines (F10) |
 | 2026-11-06 | 3 (step 0) | Postgres + Redis added; all fixes behind switches, off by default. Measured the naive baseline. | - | `/products/{id}` ceiling ~340 RPS (375 collapses, Postgres CPU 100%) | Connection per request (F9), no deadlines (F10) |
 | 2026-11-05 | 2 | Load shedding: per-endpoint in-flight caps with immediate `503` + `Retry-After`. `/io` and `/fast` 1,000; `/cpu` = GOMAXPROCS (a cap of 50 failed, F6). pprof moved to internal `:6060`. | `/cpu` 2,000 spike: p99 3.94 s, 10,989 dropped, 209 MiB | `/cpu` 4,000 spike: accepted p99 145 ms, 66% shed, 50 MiB | F7: shedding in front of the server |
