@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	target := flag.String("target", "app:8080", "host:port to attack")
+	target := flag.String("target", "lb:8080", "host:port to attack")
 	conns := flag.Int("conns", 1000, "number of slow connections")
 	interval := flag.Duration("interval", 3*time.Second, "delay between header bytes")
 	duration := flag.Duration("duration", 60*time.Second, "how long to run")

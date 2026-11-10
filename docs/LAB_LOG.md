@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-10 · Current level: **3 finished; Level 4 skipped by decision (profile recorded); Level 5 plan drafted** (steps 0-5; `/products/{id}` target 5,000 RPS met with cache) · Open: 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
+Last updated: 2026-11-10 · Current level: **3 finished; Level 4 skipped by decision (profile recorded); Level 5 steps 0-5 measured (3 instances behind HAProxy): 10,000 RPS not yet logged as passed (2 of 4 runs fail the dropped-iterations check; nothing saturated in steady state)** (`/products/{id}` target 5,000 RPS met with cache) · Open: Level 5 step 4 overload not reached (one instance nearly keeps up with 10,000), unexplained 5xx/stall in one 10,000 RPS run, POST duplicate check (+55 orders in one run), 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
 
 ## 1. Goal and rules
 
@@ -74,6 +74,31 @@ Server protections added in Level 2:
 Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/mutex profiling is still on at rate 1 (some overhead).
 
 ## 4. Test results
+
+### Level 5, steps 0-5: HAProxy and three instances (2026-11-10)
+
+Setup: HAProxy (1 CPU, `nbthread 2`, round-robin, health check every 1 s, 2 failures = DOWN, `retry-on conn-failure`) in front of `app1`-`app3` (0.5 CPU / 512 MB each, Level 3 fixed settings: pool, `DB_TIMEOUT=300ms`, join, cache, singleflight), shared Postgres and Redis. `GET /products/{id}`, `HOT_RATIO` 0.8, k6 through `http://lb:8080`. Every test was run twice (the VM is at 7 of 8 CPUs); values below are run 1 / run 2 when they differ. CPU is the average of `docker stats` samples every 2 s (percent of one CPU, apps limit 50%, lb 100%, Redis 50%, Postgres 100%, k6 300%). Full tables and commands in [LEVEL5_GUIDE.md](LEVEL5_GUIDE.md).
+
+| Step | Test | Result |
+| --- | --- | --- |
+| 0 | One instance, 3,000 RPS, 45 s, direct vs through lb | p50 0.25 / 0.25 ms direct, 0.28 / 0.27 ms through lb; p95 0.64 / 0.58 vs 0.57 / 0.57 ms; p99 3.44 / 1.04 vs 1.62 / 1.32 ms. lb CPU 16%, app1 29% behind lb vs 35-37% direct. All pass |
+| 1 | Three instances, 60 s | 5,000: p99 1.8 / 1.5 ms, pass both. 8,000: p99 6.3 / 34 ms, dropped 0 / 398. 10,000: p99 7.9 / 8.9 ms, dropped 177 / 0. 0 errors everywhere. Traffic even (`stot` within 2). Postgres 30 idle connections (3 x 10) |
+| 2 | Kill / pause app2 at 3,000 RPS | Kill: 0 failed requests, p99 1 s, 1,163 / 1,164 dropped, `DOWN` after 3.4 s, back `UP` 2.1 s after restart. Pause: 1.09% / 1.11% errors, p99 5 s, 4,186 / 4,147 dropped, `DOWN` after 3.8 s, back `UP` 1.6 s after unpause |
+| 2 | POST /orders, 300 RPS, kill app2 | 3 runs: orders added = `201`s in two (11,946; 11,947). Third run: 703 failed (DB timeouts on all three instances, not the kill), and 55 more orders than `201`s (11,270 vs 11,215). LB retries: 0 (`econ` and `wretr` 0) |
+| 3 | app2 at 0.1 CPU, 4,500 RPS | Round-robin p99 70.8 / 67.9 ms, app2 got 33% of requests, pass both. `leastconn` p99 34.2 / 32.0 ms, app2 got 20%; dropped 1,649 / 0 |
+| 4 | One instance, spike 10,000 RPS, 30 s | a) app caps only: run 1 FAIL (503 p99 278 ms, 1.23% shed, 949 dropped), run 2 PASS (nothing shed). b) lb `maxconn` 200 + 100 ms queue: PASS both (shed 0% / 0.14%, accepted p99 43 / 37 ms). The instance was not really overloaded |
+| 5 | 10,000 RPS, 60 s | Run 1: 9,775 achieved, 13,443 dropped, 317 failed (0.05%), p99 110 ms. Run 2: 9,999 achieved, p99 3.4 ms, 0 errors, 0 dropped. Steady CPU: apps 37% (of 50), lb 47% (of 100), Redis 20% (of 50), Postgres 10%, k6 about 110% (of 300) |
+
+**What I learned.**
+
+- **The load balancer is cheap.** About 25-30 microseconds on the median and about 16% of one CPU at 3,000 RPS (HAProxy reuses connections to the apps). Three instances behind it share traffic evenly and use 30 Postgres connections.
+- **Scaling worked, but the ceiling was not found.** Three instances serve 10,000 RPS with every component well under its limit in steady state. The closest to a limit are the apps (about 74% of quota), then the lb (47%), Redis (about 40% of its limit), k6 (about 37% of its limit) and Postgres (10%). k6 only went over its CPU limit in a single sample (338%) during a stall in one run. So the honest result at 10,000 RPS is "k6 at its own edge, the system not yet saturated". I am not logging 10,000 as passed: of four runs, two failed the dropped-iterations check (177 and 13,443) with p99 and errors passing, two passed all three checks. I did not find the cause of the failing runs.
+- **Failure behavior depends on how the lb learns.** A killed instance leaves DNS, and the lb marked it out in 3.4 s with no failed requests but a 1 s p99 (stalled connects). A frozen instance cost 1.1% errors and a 5 s p99 until the health check fired after 3.8 s. Neither run met the SLO.
+- **Duplicate-order check: no LB retry, but not clean either.** The lb never retried (`econ`, `wretr` 0). In one of three runs, 703 requests failed with DB timeouts and 55 more orders were created than `201`s returned, probably committed inserts whose reply was lost to the 300 ms timeout (not verified). This is the failure Level 6 (draining before stop) is meant to reduce; DB timeouts after commit are a separate problem (idempotency).
+- **`leastconn` helped, not dramatically.** With one 0.1 CPU instance the cached path is so cheap that round-robin still passed (p99 about 70 ms); `leastconn` halved p99 to about 33 ms and gave the slow instance 20% of the traffic instead of 33%.
+- **Step 4 did not test shedding.** One instance took 10,000 RPS with at most 1.2% shed, so there was no 2x overload to shed. The lb's `maxconn` and queue timeout worked as configured (queue peak 901 / 1,399, 0.14% `503`s in one run) but I can't say it beat the app caps. Needs an overload (slowed instance) to compare. Single-instance CPU reading (57%) is inconsistent with three instances at 37% each for the same rate; unexplained.
+
+Not run: a rate above 10,000 (k6 caps there), a second load generator, `leastconn` at 10,000, an overload test with a slowed instance.
 
 ### Level 3, step 5: singleflight on a cache stampede (2026-11-09)
 
@@ -419,6 +444,8 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 | 4 | Spike beyond total capacity, shed at the LB (`maxconn` + a queue timeout, `503`) vs only in the app | F7: rejecting in the LB costs the app nothing. Compare against Level 2's in-app caps (3 instances x 1,000 in flight) |
 | 5 | 10,000 RPS on `/products/{id}`, find the first limiter | Redis CPU, Postgres CPU, LB CPU, or k6. Which one hits 100% first, and what would you scale next? |
 
+**Status (2026-11-10): setup built and measured (steps 0-5, results in section 4).** HAProxy (`lb/haproxy.cfg`) with `app1`-`app3` (YAML anchor), compose defaults now the fixed Level 3 settings, `make up N=`, `make lbstats`, `make kill-app/start-app/slow-app/fast-app`. Smoke checks (single requests): traffic splits 3/3/3 by round-robin; a killed instance goes to `MAINT (resolution)` within ~4 s and rejoins after restart; `N=1` serves only from app1; `LB_BALANCE=leastconn LB_SERVER_MAXCONN=50 LB_QUEUE_TIMEOUT=200ms` is accepted. Test guide: [LEVEL5_GUIDE.md](LEVEL5_GUIDE.md).
+
 **Open question for you:** keep k6's 10,000 RPS limit in mind. If k6 is the first limiter at step 5, the honest result is "k6 capped, the system not yet", and we'd say so in the log rather than call 10,000 passed.
 
 **Not in Level 5:** graceful shutdown and redeploys (Level 6), autoscaling, TLS at the LB, the optional hot-row test.
@@ -443,6 +470,8 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-10 | 5 (steps 0-5) | Measured Level 5: HAProxy in front of 1 and 3 instances, kill and pause under load, a slow instance with round-robin vs `leastconn`, spike shedding at the lb, and 10,000 RPS (no code change). | 1 instance: ~5,000 RPS (Level 3); lb cost unknown | 3 instances: 5,000 and 8,000 pass mostly, 10,000 passes 2 of 4 runs (dropped iterations only), nothing saturated in steady state; lb adds ~0.03 ms and ~16% CPU at 3,000 RPS; kill = 0 errors but 1 s p99, pause = 1.1% errors | Level 5 not closed: find why 10,000 sometimes drops iterations, a second load generator, a real overload for step 4; Level 6 (graceful drain) |
+| 2026-11-10 | 5 (setup) | HAProxy load balancer plus three app instances (`app1`-`app3`), `make up N=`, `make lbstats`, failure helpers; compose defaults = fixed Level 3 settings; k6 and slowloris target `lb`. Measurements are in the next row. | 1 instance, ~5,000 RPS on `/products/{id}` | see the steps 0-5 row | Step 0 (load balancer cost) through step 5 (first shared limit) |
 | 2026-11-09 | 3 (step 5) | Measured `SINGLEFLIGHT=on` vs off on a cache stampede (one hot key, 1 s TTL, 3,000 RPS), and a 300-request burst on one cold key. | Burst: 300 DB queries; stampede: 7.5 loads per expiry, p99 4.2 ms | Burst: **1** DB query; stampede: **1.0** per expiry, p99 1.1 ms | Hot-row lock on orders (bonus, not run); stampedes at higher rates not tested |
 | 2026-11-09 | 3 (step 4) | Measured the Redis cache-aside path (`CACHE=on`, no code change). | Every read hits Postgres; Postgres 37% CPU at the step 1 ceiling | Cache ceiling **~5,000 RPS** (hit ratio 82% at `HOT_RATIO` 0.8, 41% uniform, 98% at 0.99); Postgres 8% at 5,000 | 8,000 RPS failure (F15); hit ratio depends on skew |
 | 2026-11-09 | 3 (step 3) | Measured `LIST_QUERY=join` vs N+1 on the list endpoint (no code change; the switch already existed). | List: 21 queries per request, ceiling ~750 RPS (pool held for 21 round trips) | 1 query, ceiling ~1,500 RPS, p99 at 300 RPS 13.2 → 3.6 ms | Postgres CPU; list query plan (F14); Redis cache (step 4) |

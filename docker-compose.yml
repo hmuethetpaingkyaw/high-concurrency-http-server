@@ -1,41 +1,71 @@
 # Resource limits emulate EC2 sizes. Override per level, e.g.:
 #   APP_CPUS=0.5 APP_MEM=512m docker compose up -d --build
+# Level 5: three identical app instances (app1-3) behind HAProxy (lb).
+# The Level 3 switches now default to the FIXED settings (pool, timeout, join,
+# cache, singleflight). Set DB_POOL=off, CACHE=off, ... to reproduce the naive steps.
+x-app: &app
+  build: .
+  image: hcs-app:latest
+  environment:
+    CPU_ROUNDS: "${CPU_ROUNDS:-5000}"
+    # In-flight caps per endpoint (0 disables shedding). Defaults live in main.go.
+    MAX_INFLIGHT_FAST: "${MAX_INFLIGHT_FAST:-}"
+    MAX_INFLIGHT_IO: "${MAX_INFLIGHT_IO:-}"
+    MAX_INFLIGHT_CPU: "${MAX_INFLIGHT_CPU:-}"
+    MAX_INFLIGHT_DB: "${MAX_INFLIGHT_DB:-}"
+    DATABASE_URL: "postgres://app:app@postgres:5432/shop?sslmode=disable"
+    REDIS_ADDR: "redis:6379"
+    DB_POOL: "${DB_POOL:-on}"            # level 3 step 1
+    DB_MAX_CONNS: "${DB_MAX_CONNS:-10}"  # per instance: 3 instances = 30 of Postgres's 100
+    DB_MIN_CONNS: "${DB_MIN_CONNS:-0}"
+    DB_TIMEOUT: "${DB_TIMEOUT:-300ms}"   # level 3 step 2
+    LIST_QUERY: "${LIST_QUERY:-join}"    # level 3 step 3
+    CACHE: "${CACHE:-on}"                # level 3 step 4
+    CACHE_TTL: "${CACHE_TTL:-30s}"
+    SINGLEFLIGHT: "${SINGLEFLIGHT:-on}"  # level 3 step 5
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_started
+  deploy:
+    resources:
+      limits:
+        cpus: "${APP_CPUS:-0.5}"   # each instance is the Level 3 box
+        memory: "${APP_MEM:-512m}"
+
 services:
-  app:
-    build: .
-    image: hcs-app:latest
+  # Only the load balancer is public. Instances are reached through it; their
+  # pprof/expvar ports are published on this Mac only (6061-6063).
+  lb:
+    image: haproxy:3.0-alpine
     ports:
-      - "8080:8080" # for manual curl only; load tests stay inside the Docker network
-      - "127.0.0.1:6060:6060" # pprof: reachable from this Mac only, like a private network
+      - "8080:8080"           # all traffic enters here
+      - "127.0.0.1:8404:8404" # HAProxy stats page
     environment:
-      CPU_ROUNDS: "${CPU_ROUNDS:-5000}"
-      # In-flight caps per endpoint (0 disables shedding). Defaults live in main.go.
-      MAX_INFLIGHT_FAST: "${MAX_INFLIGHT_FAST:-}"
-      MAX_INFLIGHT_IO: "${MAX_INFLIGHT_IO:-}"
-      MAX_INFLIGHT_CPU: "${MAX_INFLIGHT_CPU:-}"
-      MAX_INFLIGHT_DB: "${MAX_INFLIGHT_DB:-}"
-      # Level 3: Postgres + Redis. Every fix is a toggle; defaults are the naive
-      # (step 0) behavior. See docs/LEVEL3_GUIDE.md.
-      DATABASE_URL: "postgres://app:app@postgres:5432/shop?sslmode=disable"
-      REDIS_ADDR: "redis:6379"
-      DB_POOL: "${DB_POOL:-off}"            # step 1: on = connection pool
-      DB_MAX_CONNS: "${DB_MAX_CONNS:-10}"   # step 1: pool size
-      DB_MIN_CONNS: "${DB_MIN_CONNS:-0}"    # step 1: connections opened at startup
-      DB_TIMEOUT: "${DB_TIMEOUT:-0}"        # step 2: e.g. 300ms; 0 = no timeout
-      LIST_QUERY: "${LIST_QUERY:-n+1}"      # step 3: join = one query
-      CACHE: "${CACHE:-off}"                # step 4: on = Redis cache-aside
-      CACHE_TTL: "${CACHE_TTL:-30s}"
-      SINGLEFLIGHT: "${SINGLEFLIGHT:-off}"  # step 5: on = one DB load per key
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_started
+      LB_BALANCE: "${LB_BALANCE:-roundrobin}"             # step 3: leastconn
+      LB_SERVER_MAXCONN: "${LB_SERVER_MAXCONN:-0}"        # step 4: max requests in flight per instance (0 = unlimited)
+      LB_QUEUE_TIMEOUT: "${LB_QUEUE_TIMEOUT:-1s}"         # step 4: how long a request may wait for a free slot
+    volumes:
+      - ./lb/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     deploy:
       resources:
         limits:
-          cpus: "${APP_CPUS:-0.5}"   # level 2: half a vCPU (levels 0-1 used 0.1 / 128m)
-          memory: "${APP_MEM:-512m}"
+          cpus: "${LB_CPUS:-1}"
+          memory: 256m
+
+  app1:
+    <<: *app
+    ports:
+      - "127.0.0.1:6061:6060"
+  app2:
+    <<: *app
+    ports:
+      - "127.0.0.1:6062:6060"
+  app3:
+    <<: *app
+    ports:
+      - "127.0.0.1:6063:6060"
 
   postgres:
     image: postgres:16.4-alpine
@@ -70,6 +100,7 @@ services:
     image: grafana/k6:1.0.0
     profiles: ["load"] # only started via `docker compose run k6 ...`
     environment:
+      TARGET: "http://lb:8080"   # load goes through the load balancer
       K6_NO_USAGE_REPORT: "true" # also works around a compose panic on `run -e` with no environment block
     volumes:
       - ./loadtest:/scripts:ro

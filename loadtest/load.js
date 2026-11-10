@@ -7,7 +7,7 @@
 import http from 'k6/http';
 import { Rate } from 'k6/metrics';
 
-const TARGET = __ENV.TARGET || 'http://app:8080';
+const TARGET = __ENV.TARGET || 'http://lb:8080';
 const ENDPOINT = __ENV.ENDPOINT || '/io';
 const RATE = Number(__ENV.RATE || 100);
 const DURATION = __ENV.DURATION || '1m';
