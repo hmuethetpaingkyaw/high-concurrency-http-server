@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-09 · Current level: **3 finished** (steps 0-5; `/products/{id}` target 5,000 RPS met with cache) · Open: 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
+Last updated: 2026-11-09 · Current level: **3 finished; Level 4 in progress (baseline profiled, plan drafted)** (steps 0-5; `/products/{id}` target 5,000 RPS met with cache) · Open: 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
 
 ## 1. Goal and rules
 
@@ -365,6 +365,30 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 - **Steps:** 0 naive baseline → 1 connection pool (and pool sizing) → 2 query timeouts under a frozen DB → 3 N+1 vs join → 4 Redis cache-aside (hit ratio vs traffic skew) → 5 cache stampede with singleflight. Bonus: hot-row lock contention on orders.
 - **Target:** `GET /products/{id}` passes the SLO at 5,000 RPS on the 0.5 CPU app.
 - **Claude's smoke checks (single requests, not load tests):** each switch does what it says. Pool: 20 requests used 1 connection. Timeout: frozen DB gives `504` in 0.30 s vs a 3.2 s hang. List: 21 queries vs 1. Cache: an order invalidates the cached product. Singleflight: 300 parallel misses on one key make 300 queries vs 1.
+
+### Level 4 plan (draft, 2026-11-09): CPU per request
+
+**Baseline** (`/products/{id}`, cache on, `HOT_RATIO` 0.8, 3,000 RPS, 45 s, Level 3 switches on): 135,006 requests, 0 errors, 0 dropped, median 0.25 ms, p95 0.63 ms, max 146 ms. Memory 33 MiB of 512. Profiled 20 s with `pprof` (`profile` and `allocs`).
+
+**What the CPU profile says** (6.09 s of CPU in 20 s, about 100 µs per request):
+
+| Share | What | Meaning |
+| --- | --- | --- |
+| 49% | `syscall.Syscall6` (socket reads and writes) | Mostly network I/O: the client connection plus the Redis round trip |
+| ~20% | scheduler, `netpoll`, `futex` | Goroutine wakeups for each network event |
+| 24% | our `getProduct` path (inside the same samples) | Redis `GET` 15%, database load on a miss 8%, JSON 3% |
+| 2.5% | GC (`gcBgMarkWorker`) | **GC is not the bottleneck at this rate** |
+
+**What the allocation profile says** (471 MB over the profiled window, about 3.5 KB per request): 59% is in the request chain, and most of that is `net/http` itself (header parsing and `Header.Clone`, 45 MB). Our own code (`loadProduct`, `json.Marshal`) is under 15%.
+
+**Hypothesis (revised):** the roadmap predicted "GC pressure from allocations". The data doesn't support that at 3,000 RPS. The cost is the number of system calls and round trips per request. A cache hit still makes one Redis round trip, so the app-side lever is fewer round trips, not fewer bytes.
+
+**Candidate fixes (not implemented; pick one after the user's review):**
+1. **In-process cache in front of Redis** (small TTL map). Removes the Redis round trip on hot keys. Risk: each instance caches separately, so invalidation after an order has to reach every instance (matters at Level 5).
+2. **`sync.Pool` or avoiding `Header.Clone`** in our code. Small gain. Most allocations are in `net/http`, which we can't pool without replacing it.
+3. **Cheaper JSON.** Little left: a cache hit already serves pre-encoded bytes.
+
+**Before coding:** rerun the baseline twice to separate noise (about 10-20% per Level 2 notes) and look for the 8,000 RPS failure cause (F15), since it may be the same syscall or shedding limit.
 
 ## 7. Level roadmap
 
