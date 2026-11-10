@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-09 · Current level: **3 finished; Level 4 in progress (baseline profiled, plan drafted)** (steps 0-5; `/products/{id}` target 5,000 RPS met with cache) · Open: 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
+Last updated: 2026-11-10 · Current level: **3 finished; Level 4 skipped by decision (profile recorded); Level 5 plan drafted** (steps 0-5; `/products/{id}` target 5,000 RPS met with cache) · Open: 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
 
 ## 1. Goal and rules
 
@@ -388,7 +388,40 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 2. **`sync.Pool` or avoiding `Header.Clone`** in our code. Small gain. Most allocations are in `net/http`, which we can't pool without replacing it.
 3. **Cheaper JSON.** Little left: a cache hit already serves pre-encoded bytes.
 
-**Before coding:** rerun the baseline twice to separate noise (about 10-20% per Level 2 notes) and look for the 8,000 RPS failure cause (F15), since it may be the same syscall or shedding limit.
+**Decision (2026-11-10): skip the fixes.** The profile is recorded as the finding; no Level 4 code. Moving on to Level 5.
+
+**Before coding (not done):** rerun the baseline twice to separate noise (about 10-20% per Level 2 notes) and look for the 8,000 RPS failure cause (F15), since it may be the same syscall or shedding limit.
+
+### Level 5 plan (draft, 2026-11-10): horizontal scaling behind a load balancer
+
+**Goal:** `GET /products/{id}` (the Level 3 workload, cache on) passes the SLO at **10,000 RPS** through a load balancer, with 3 app instances. Also: survive an instance dying under load, and shed overload at the edge (F7). Each instance is still the Level 3 box (0.5 CPU / 512 MB); a single instance topped out at ~5,000 RPS.
+
+**Why this is the next step:** one instance can't reach 10,000, and a lone instance is a single point of failure. Three instances give ~15,000 RPS of app capacity on paper, so the question becomes what limits first: the load balancer, Redis (0.5 CPU, single-threaded), Postgres (1 CPU, behind 3 pools), or k6 itself (it tops out near 10,000 RPS on this Mac).
+
+**Design (proposed, change if you disagree):**
+
+| Choice | Proposal | Why |
+| --- | --- | --- |
+| Load balancer | HAProxy (own container, 1 CPU / 256 MB) | Active health checks, a stats page, and `leastconn`. nginx open source only has passive checks |
+| Instances | Three services `app1`, `app2`, `app3` from one YAML anchor | Fixed names for kill and pause tests; per-instance pprof on `127.0.0.1:6061-6063`. `--scale` would clash on fixed host ports |
+| Entry point | HAProxy publishes `:8080`; instances publish nothing | k6 changes target from `http://app:8080` to `http://lb:8080` (`TARGET`) |
+| Budget | k6 3 + Postgres 1 + Redis 0.5 + 3 apps 1.5 + LB 1 = 7 of the VM's 8 CPUs | Tight: expect more noise, run each test twice. The "reduce VM to 6 CPUs" TODO stays off |
+| Shared state | None added. Level 4's in-process cache is skipped, so there are no per-instance copies to invalidate | Keeps scaling free of cache-coherence bugs |
+
+**Steps (each one measured and logged, like Level 3):**
+
+| Step | Test | What it teaches |
+| --- | --- | --- |
+| 0 | LB in front of **one** instance, same load as the Level 3 baseline (3,000 RPS) | The LB's own cost (latency and CPU). Common trap: no keep-alive to the backend means a new connection per request (the F9 pattern) |
+| 1 | Three instances, round-robin, ramp to the ceiling | Does throughput scale ~3x? Is traffic even (per-instance `requests` counter)? Connections to Postgres: 3 pools x 10 = 30 of 100 |
+| 2 | Kill one instance under load (`docker kill app2`) | Errors until the LB notices (active vs passive checks). **Retries:** safe for `GET`, dangerous for `POST /orders` (a retry can order twice). This is the problem Level 6's graceful shutdown solves |
+| 3 | Slow down one instance (`docker pause` or a 0.1 CPU limit), round-robin vs `leastconn` | One slow instance drags the whole p99 under round-robin; `leastconn` routes around it |
+| 4 | Spike beyond total capacity, shed at the LB (`maxconn` + a queue timeout, `503`) vs only in the app | F7: rejecting in the LB costs the app nothing. Compare against Level 2's in-app caps (3 instances x 1,000 in flight) |
+| 5 | 10,000 RPS on `/products/{id}`, find the first limiter | Redis CPU, Postgres CPU, LB CPU, or k6. Which one hits 100% first, and what would you scale next? |
+
+**Open question for you:** keep k6's 10,000 RPS limit in mind. If k6 is the first limiter at step 5, the honest result is "k6 capped, the system not yet", and we'd say so in the log rather than call 10,000 passed.
+
+**Not in Level 5:** graceful shutdown and redeploys (Level 6), autoscaling, TLS at the LB, the optional hot-row test.
 
 ## 7. Level roadmap
 
