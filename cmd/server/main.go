@@ -1,6 +1,6 @@
-// Level 2: the server survives overload. Timeouts cut off slow clients, the GC
-// knows the container's memory limit, and each endpoint sheds load with a fast
-// 503 once its in-flight cap is full. Graceful shutdown is still missing.
+// Level 3: shop endpoints backed by Postgres and Redis (see shop.go), on top
+// of Level 2's overload protection (timeouts, memory limit, per-endpoint
+// in-flight caps). Graceful shutdown is still missing.
 package main
 
 import (
@@ -48,6 +48,14 @@ func main() {
 	mux.HandleFunc("/fast", limit(envInt("MAX_INFLIGHT_FAST", 1000), fastHandler))
 	mux.HandleFunc("/io", limit(envInt("MAX_INFLIGHT_IO", 1000), ioHandler))
 	mux.HandleFunc("/cpu", limit(envInt("MAX_INFLIGHT_CPU", runtime.GOMAXPROCS(0)), cpuHandler))
+
+	// Level 3: shop endpoints. Each gets its own in-flight cap (MAX_INFLIGHT_DB).
+	shop := newShop()
+	dbCap := envInt("MAX_INFLIGHT_DB", 1000)
+	mux.HandleFunc("GET /products/{id}", limit(dbCap, shop.getProduct))
+	mux.HandleFunc("GET /products", limit(dbCap, shop.listProducts))
+	mux.HandleFunc("POST /orders", limit(dbCap, shop.createOrder))
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -64,13 +72,13 @@ func main() {
 		MaxHeaderBytes:    64 << 10,         // 64 KB of headers is plenty; the default is 1 MB
 	}
 
-	// Debug server: pprof on an internal port that the outside world can't
+	// Debug server: pprof and /debug/vars (expvar) on an internal port that the outside world can't
 	// reach (published only on 127.0.0.1 in compose). No WriteTimeout, because
 	// a CPU profile streams for as many seconds as you ask for.
 	debugSrv := &http.Server{Addr: ":6060", Handler: http.DefaultServeMux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { log.Fatal(debugSrv.ListenAndServe()) }()
 
-	log.Printf("level-2 server listening on :8080 (GOMAXPROCS=%d, memory limit=%d MiB)",
+	log.Printf("level-3 server listening on :8080 (GOMAXPROCS=%d, memory limit=%d MiB)",
 		runtime.GOMAXPROCS(0), debug.SetMemoryLimit(-1)>>20)
 	// Mistake: no graceful shutdown. SIGTERM kills the process instantly and
 	// drops in-flight requests.
@@ -147,6 +155,13 @@ func setMemoryLimit() {
 		return // "max" means no limit
 	}
 	debug.SetMemoryLimit(limit / 10 * 9)
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v, err := time.ParseDuration(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
 }
 
 func envInt(key string, def int) int {

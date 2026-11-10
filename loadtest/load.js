@@ -12,6 +12,15 @@ const ENDPOINT = __ENV.ENDPOINT || '/io';
 const RATE = Number(__ENV.RATE || 100);
 const DURATION = __ENV.DURATION || '1m';
 const MODE = __ENV.MODE || 'constant';
+const METHOD = __ENV.METHOD || 'GET';
+
+// Level 3 placeholders in ENDPOINT: {id} becomes a product id, {cat} a category.
+// Real traffic is skewed: HOT_RATIO of requests go to the HOT_KEYS most
+// popular products, the rest are spread over all MAX_ID.
+const MAX_ID = Number(__ENV.MAX_ID || 100000);
+const HOT_KEYS = Number(__ENV.HOT_KEYS || 1000);
+const HOT_RATIO = Number(__ENV.HOT_RATIO || 0.8);
+const CATEGORIES = 50;
 
 // VUs needed = RATE x latency (Little's Law). Start with enough for 200ms
 // latency and let k6 add more on demand, up to 2s, before it drops iterations.
@@ -73,8 +82,27 @@ export const options = {
   },
 };
 
+function pickId() {
+  const n = Math.random() < HOT_RATIO ? HOT_KEYS : MAX_ID;
+  return 1 + Math.floor(Math.random() * n);
+}
+
 export default function () {
-  const res = http.get(`${TARGET}${ENDPOINT}?${__VU}-${__ITER}`, { timeout: '5s' });
+  const path = ENDPOINT
+    .replace('{id}', pickId())
+    .replace('{cat}', `cat-${1 + Math.floor(Math.random() * CATEGORIES)}`);
+  // Tag every request with the endpoint template, not its unique URL, or k6
+  // creates a new time series per request and its memory grows without bound.
+  const params = { timeout: '5s', headers: { 'Content-Type': 'application/json' }, tags: { name: ENDPOINT } };
+  let res;
+  if (METHOD === 'POST') {
+    // POST /orders: buy one unit of a (possibly hot) product.
+    res = http.post(`${TARGET}${path}`, JSON.stringify({ product_id: pickId(), qty: 1 }), params);
+  } else {
+    // A unique query suffix so no two /cpu requests hash the same input.
+    const sep = path.includes('?') ? '&' : '?';
+    res = http.get(`${TARGET}${path}${sep}r=${__VU}-${__ITER}`, params);
+  }
   shed.add(res.status === 503);
   unexpected.add(res.status !== 200 && res.status !== 503);
 }
