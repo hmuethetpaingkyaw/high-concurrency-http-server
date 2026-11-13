@@ -4,6 +4,8 @@ Level 3 puts a real database and cache behind the server. The code for every fix
 
 Record your numbers in the tables at each step, then send them to Claude to log in `LAB_LOG.md`.
 
+> **Note (Level 5 and later):** `docker-compose.yml` now defaults to the *fixed* settings (pool on, timeout 300ms, join, cache on, singleflight on) and runs three instances behind a load balancer. This guide is a record of the single-instance, naive-by-default setup (`main` at Level 3). To repeat a step on a later branch, turn the switches off explicitly, for example `DB_POOL=off CACHE=off make up N=1`, and send load with `TARGET=http://app1:8080`.
+
 ## What's new
 
 | Piece | Size (EC2-style) | Notes |
