@@ -1,23 +1,33 @@
 // Level 3: shop endpoints backed by Postgres and Redis (see shop.go), on top
 // of Level 2's overload protection (timeouts, memory limit, per-endpoint
-// in-flight caps). Graceful shutdown is still missing.
+// in-flight caps). Level 6: graceful shutdown, off by default
+// (GRACEFUL_SHUTDOWN=on; see docs/LEVEL6_GUIDE.md).
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"expvar"
 	"log"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux (internal port only)
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+// draining flips to true when a shutdown signal arrives. /readyz then answers
+// 503 so the load balancer stops sending new requests, and responses ask
+// clients to close their keep-alive connections.
+var draining atomic.Bool
 
 var (
 	// Level 1 fix: the only shared state is one counter, so an atomic
@@ -56,7 +66,16 @@ func main() {
 	mux.HandleFunc("GET /products", limit(dbCap, shop.listProducts))
 	mux.HandleFunc("POST /orders", limit(dbCap, shop.createOrder))
 
+	// Liveness: "the process is up". Never fails while the process runs.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	// Readiness (Level 6): "send me traffic". 503 once a shutdown has started.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if draining.Load() {
+			http.Error(w, "draining", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -64,7 +83,7 @@ func main() {
 	// client can't hold a goroutine and its buffers forever (slowloris).
 	srv := &http.Server{
 		Addr:              ":8080",
-		Handler:           http.MaxBytesHandler(mux, maxBodyBytes),
+		Handler:           http.MaxBytesHandler(closeWhenDraining(mux), maxBodyBytes),
 		ReadHeaderTimeout: 5 * time.Second,  // finish sending headers in 5s or be cut off
 		ReadTimeout:       10 * time.Second, // whole request, including body
 		WriteTimeout:      15 * time.Second, // handler + writing the response
@@ -78,11 +97,73 @@ func main() {
 	debugSrv := &http.Server{Addr: ":6060", Handler: http.DefaultServeMux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { log.Fatal(debugSrv.ListenAndServe()) }()
 
-	log.Printf("level-3 server listening on :8080 (GOMAXPROCS=%d, memory limit=%d MiB)",
-		runtime.GOMAXPROCS(0), debug.SetMemoryLimit(-1)>>20)
-	// Mistake: no graceful shutdown. SIGTERM kills the process instantly and
-	// drops in-flight requests.
-	log.Fatal(srv.ListenAndServe())
+	graceful := os.Getenv("GRACEFUL_SHUTDOWN") == "on"
+	drainDelay := envDuration("DRAIN_DELAY", 5*time.Second)
+	shutdownTimeout := envDuration("SHUTDOWN_TIMEOUT", 15*time.Second)
+	poolCloseTimeout := envDuration("POOL_CLOSE_TIMEOUT", 3*time.Second)
+	expvar.Publish("level6_config", expvar.Func(func() any {
+		return map[string]any{
+			"GRACEFUL_SHUTDOWN":  graceful,
+			"DRAIN_DELAY":        drainDelay.String(),
+			"SHUTDOWN_TIMEOUT":   shutdownTimeout.String(),
+			"POOL_CLOSE_TIMEOUT": poolCloseTimeout.String(),
+		}
+	}))
+
+	log.Printf("level-6 server listening on :8080 (GOMAXPROCS=%d, memory limit=%d MiB, graceful shutdown=%v)",
+		runtime.GOMAXPROCS(0), debug.SetMemoryLimit(-1)>>20, graceful)
+
+	if !graceful {
+		// Naive (step 0): SIGTERM kills the process instantly and drops
+		// every in-flight request.
+		log.Fatal(srv.ListenAndServe())
+	}
+
+	// Level 6: handle SIGTERM/SIGINT. Docker sends SIGTERM first and SIGKILL
+	// when stop_grace_period runs out, so everything below must finish inside
+	// that period (DRAIN_DELAY + SHUTDOWN_TIMEOUT < stop_grace_period).
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServe() }()
+
+	select {
+	case err := <-serveErr:
+		log.Fatal(err) // could not start (for example, the port is taken)
+	case <-ctx.Done():
+	}
+	stop() // a second signal now kills the process the default way
+
+	// 1. Say "not ready". The load balancer's health check notices and stops
+	//    sending new requests. The server keeps serving until then.
+	log.Printf("shutdown: signal received, readiness off, draining for %s", drainDelay)
+	draining.Store(true)
+	time.Sleep(drainDelay)
+
+	// 2. Stop accepting, let in-flight requests finish (up to the timeout).
+	log.Printf("shutdown: closing server (timeout %s)", shutdownTimeout)
+	shCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shCtx); err != nil {
+		log.Printf("shutdown: %v, forcing close of remaining connections", err)
+		srv.Close()
+	}
+
+	// 3. Only now close the database and Redis connections (bounded wait).
+	shop.close(poolCloseTimeout)
+	log.Printf("shutdown: complete")
+}
+
+// closeWhenDraining asks clients to close their keep-alive connection after
+// the response once a shutdown has started, so they reconnect (to another
+// instance) instead of reusing a connection that is about to be closed.
+func closeWhenDraining(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if draining.Load() {
+			w.Header().Set("Connection", "close")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // fastHandler is the cheapest possible request: bump a counter and reply.

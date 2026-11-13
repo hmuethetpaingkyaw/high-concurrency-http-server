@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-10 · Current level: **3 finished; Level 4 skipped by decision (profile recorded); Level 5 steps 0-5 measured (3 instances behind HAProxy): 10,000 RPS not yet logged as passed (2 of 4 runs fail the dropped-iterations check; nothing saturated in steady state)** (`/products/{id}` target 5,000 RPS met with cache) · Open: Level 5 step 4 overload not reached (one instance nearly keeps up with 10,000), unexplained 5xx/stall in one 10,000 RPS run, POST duplicate check (+55 orders in one run), 8,000 RPS cache failure (F15), list index (F14), bonus hot-row test not run
+Last updated: 2026-11-10 · Current level: **Level 6 steps 0-4 measured (graceful shutdown: a rolling restart under load gave 0 failed GETs at 3,000 and 5,000 RPS, 1 of 2 at 10,000; POST not clean); Level 5 finished (3 instances behind HAProxy; 10,000 RPS reached, 2 of 4 runs pass, k6 at its limit)** · Open: Level 6 POST noise (one run 2.51% errors, +74 orders over `201`s, cause unchecked), `pool.Close()` has no timeout (step 3), POST duplicate check (+55 orders in one run), unexplained 5xx/stall in one 10,000 RPS run, Level 5 step 4 overload not reached, 8,000 RPS cache failure (F15), list index (F14). Skipped: Level 4 fixes, hot-row bonus
 
 ## 1. Goal and rules
 
@@ -74,6 +74,34 @@ Server protections added in Level 2:
 Still open: no graceful shutdown (SIGTERM drops in-flight requests), and block/mutex profiling is still on at rate 1 (some overhead).
 
 ## 4. Test results
+
+### Level 6, steps 0-4: graceful shutdown and rolling restarts (2026-11-10)
+
+**Follow-up (2026-11-13): pool-close bug fixed.** `shop.close()` waited without a limit for busy pool connections, so a frozen database stretched the restart to 20.6 s (step 3). It now gives up after `POOL_CLOSE_TIMEOUT` (default 3 s). Same test after the fix: restart 16.4 s (5 s drain + 8 s timeout + 3 s), log `pool still has busy connections after 3s, giving up`. Budget: 5 + 15 + 3 = 23 s of the 30 s `STOP_GRACE_PERIOD`.
+
+Setup: same stack as Level 5 (HAProxy, `app1`-`app3`, Level 3 fixed settings), `LB_PORT=18080` (8080 was taken by another project), restarts by `make rolling-restart GAP=10` (`docker compose restart appN`, 30 s `STOP_GRACE_PERIOD`) starting 10 s into a 60 s test. Every test ran twice (VM at 7 of 8 CPUs); values are run 1 / run 2. The load balancer was restarted before each run to reset its counters. `5xx` is the lb backend row; `econ` (failed connects) was 0 in every run. Orders diff = orders added minus `201` responses (positive = saved, but the client saw a failure). Commands and tables in [LEVEL6_GUIDE.md](LEVEL6_GUIDE.md).
+
+| Step | Settings | GET 3,000 RPS | POST /orders 300 RPS |
+| --- | --- | --- | --- |
+| 0 | naive (`GRACEFUL_SHUTDOWN` off) | failed 6 / 0 (0.00%), p99 60.4 / 9.5 ms, dropped 75 / 0, `5xx` 6 / 0 | failed 3 / 19 (0.01% / 0.10%), p99 23.5 / 104 ms, dropped 0 / 15, `5xx` 0 / 15; orders added 17,998 / 17,968, diff 0 / +1 |
+| 1 | `GRACEFUL_SHUTDOWN=on DRAIN_DELAY=0s` | failed 0 / 0, p99 6.6 / 3.1 ms, dropped 0 / 0 | run 1: failed 2, p99 66 ms, dropped 43, diff +1. Run 2: failed 451 (2.51%), p99 303 ms, dropped 93, `5xx` 163 / 155 / 132 per instance, orders 17,531 vs `201`s 17,457, diff +74 |
+| 2 | `GRACEFUL_SHUTDOWN=on LB_HEALTH_PATH=/readyz` (drain 5 s) | failed 0 / 0, p99 39.4 / 3.1 ms, dropped 382 / 0 | failed 0 / 4, p99 4.4 / 9.9 ms, dropped 0 / 5, `5xx` 0 / 4; orders 18,001 / 17,992 = `201`s, diff 0 / 0 |
+| 3 | step 2 + `SHUTDOWN_TIMEOUT=8s DB_TIMEOUT=0 CACHE=off`, Postgres frozen 25 s, app1 restarted 5 s in, 200 RPS | `docker compose restart app1` 20.6 s; k6 1,662 of 5,992 failed (27.7%), p99 5 s, 3,009 dropped (all three instances hung on the frozen database) | - |
+| 4 | step 2 settings, GET with rolling restart | 5,000: failed 0 / 0, p99 11.8 / 7.5 ms, dropped 0 / 0, pass both. 10,000: run 1 FAIL (2,488 failed = 0.41%, p99 141 ms, 3,509 dropped, `5xx` 329 on app1 and 2,159 on app3), run 2 PASS (0 failed, p99 22.7 ms, 0 dropped) | - |
+
+One-instance drain (step 2, no load): the lb marked app1 `DOWN` at 1.4-2.0 s after `docker compose stop app1` (smoke check said 1.6 s), `docker stop` returned at 5.3 s (smoke check 5.4 s). The log showed `signal received, readiness off, draining for 5s`, `closing server`, `complete` (5 s apart, then immediate).
+
+Step 3 log (app1): `signal received` 08:28:30, `closing server (timeout 8s)` :35, `context deadline exceeded, forcing close of remaining connections` :43, `complete` :50. `complete` came when Postgres was unpaused (:50): `shop.close()` (pool `Close()`) waits for the hung queries and has no timeout. Per instance `5xx` and `econ` were 0; the 861 backend `5xx` cause was not checked. Postgres was unpaused afterwards and is healthy.
+
+**What I learned.**
+
+- **The naive baseline was much milder than expected.** A rolling restart of all three instances with no graceful shutdown cost 6 and 0 failed GETs out of about 180,000, and 3 and 19 failed POSTs out of about 18,000. The lb never hit a refused connection (`econ` 0). Level 5's kill (about 1,160 dropped iterations) was not reproduced; the one-second maximum latency in every run suggests stalled connects (the lb connect timeout is 1 s), not verified. So I have no large failure to show "fixed".
+- **The measured gain of graceful shutdown is small and inside the noise.** Step 2 (readiness drain) had 0 failed GETs twice and 0 / 4 failed POSTs with no lost orders, the best POST result of the three steps. But step 0 and step 1 GET were also at or near zero, and step 1 POST run 2 failed (2.51%, +74 orders) with errors on all three instances evenly, which is the Level 5 run-3 pattern (DB timeouts), not obviously a restart effect. I can say the drain works as designed (lb marks `DOWN` in under 2 s, the process serves for the full 5 s, then exits); I cannot say from these runs how much of the improvement it caused. A bigger sample or a harder failure would be needed.
+- **Pool close is an unbounded step in the shutdown.** With a frozen database and `DB_TIMEOUT=0`, the force-close at the timeout worked, but `pool.Close()` then waited 7 s for the DB to come back. The restart took 20.6 s, inside the 30 s grace period; with a longer freeze, Docker would `SIGKILL`. Not fixed (read-only run); a timeout around the close would bound it.
+- **At 5,000 RPS the restart is clean; at 10,000 it is 1 of 2, like Level 5.** Run 1 at 10,000 had real `5xx` (2,488, on app1 and app3), which Level 5's failing 10,000 runs mostly lacked (177 and 13,443 dropped iterations, one run with 317 failed); the cause (restart or k6 stall) is unknown.
+- **Target (rolling restart under load, 0 errors, 0 lost orders):** met on GET at 3,000 and 5,000 RPS in the readiness-drain setup, not met at 10,000 (1 of 2), and not met cleanly for POST (4 failed in one of two runs, though 0 lost orders in both).
+
+Not run: a restart with a `STOP_GRACE_PERIOD` shorter than drain + timeout, a larger sample to separate step 0 from step 2, a check of DB timeout counters during the failing POST run, an idempotency key on `POST /orders`.
 
 ### Level 5, steps 0-5: HAProxy and three instances (2026-11-10)
 
@@ -444,11 +472,44 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 | 4 | Spike beyond total capacity, shed at the LB (`maxconn` + a queue timeout, `503`) vs only in the app | F7: rejecting in the LB costs the app nothing. Compare against Level 2's in-app caps (3 instances x 1,000 in flight) |
 | 5 | 10,000 RPS on `/products/{id}`, find the first limiter | Redis CPU, Postgres CPU, LB CPU, or k6. Which one hits 100% first, and what would you scale next? |
 
-**Status (2026-11-10): setup built and measured (steps 0-5, results in section 4).** HAProxy (`lb/haproxy.cfg`) with `app1`-`app3` (YAML anchor), compose defaults now the fixed Level 3 settings, `make up N=`, `make lbstats`, `make kill-app/start-app/slow-app/fast-app`. Smoke checks (single requests): traffic splits 3/3/3 by round-robin; a killed instance goes to `MAINT (resolution)` within ~4 s and rejoins after restart; `N=1` serves only from app1; `LB_BALANCE=leastconn LB_SERVER_MAXCONN=50 LB_QUEUE_TIMEOUT=200ms` is accepted. Test guide: [LEVEL5_GUIDE.md](LEVEL5_GUIDE.md).
+**Status (2026-11-10): finished (steps 0-5, results in section 4).** 10,000 RPS was reached but not reliably: 2 of 4 runs pass (dropped iterations), and k6 was at its own limit. HAProxy (`lb/haproxy.cfg`) with `app1`-`app3` (YAML anchor), compose defaults now the fixed Level 3 settings, `make up N=`, `make lbstats`, `make kill-app/start-app/slow-app/fast-app`. Smoke checks (single requests): traffic splits 3/3/3 by round-robin; a killed instance goes to `MAINT (resolution)` within ~4 s and rejoins after restart; `N=1` serves only from app1; `LB_BALANCE=leastconn LB_SERVER_MAXCONN=50 LB_QUEUE_TIMEOUT=200ms` is accepted. Test guide: [LEVEL5_GUIDE.md](LEVEL5_GUIDE.md).
 
 **Open question for you:** keep k6's 10,000 RPS limit in mind. If k6 is the first limiter at step 5, the honest result is "k6 capped, the system not yet", and we'd say so in the log rather than call 10,000 passed.
 
 **Not in Level 5:** graceful shutdown and redeploys (Level 6), autoscaling, TLS at the LB, the optional hot-row test.
+
+### Level 6 plan (draft, 2026-11-10): graceful shutdown and zero-error redeploys
+
+**Goal:** redeploy all three instances one at a time while traffic flows, with **0 errors and 0 lost orders**. Today `SIGTERM` kills the process instantly ([main.go](../cmd/server/main.go): "Mistake: no graceful shutdown"), so every in-flight request is dropped. Level 5 already showed the cost: killing one instance dropped ~1,160 iterations, and a frozen one gave ~1% errors, because the load balancer needs ~3-4 s to notice.
+
+**Why it needs two things, not one:** a server that finishes its in-flight requests is not enough. The load balancer keeps sending new requests until its health check fails (about 3-4 s). So an instance must (1) tell the load balancer to stop sending, **then** (2) finish what it has, **then** (3) exit.
+
+**Proposed design (change if you disagree):**
+
+| Piece | Proposal | Why |
+| --- | --- | --- |
+| Signal | Catch `SIGTERM`/`SIGINT` (`signal.NotifyContext`) | Docker sends `SIGTERM` first, `SIGKILL` after the grace period |
+| Readiness | New `GET /readyz`: `200` normally, `503` once draining. HAProxy health-checks `/readyz`; `/healthz` stays for liveness | Separates "alive" from "send me traffic" |
+| Drain delay | After `SIGTERM`: fail `/readyz`, wait ~5 s (health check 1 s x 2 failures + margin), then shut down | Gives the load balancer time to stop routing |
+| Shutdown | `srv.Shutdown(ctx)` with a timeout (~15 s): stops accepting, waits for in-flight requests, closes idle keep-alive connections | In-flight `POST /orders` finish and commit |
+| Cleanup | Close the Postgres pool and Redis client after the server is done | No half-open connections for Postgres to clean up |
+| Docker | `stop_grace_period: 30s` on `app1`-`app3` (default is 10 s) | Must be longer than drain delay + shutdown timeout, or `SIGKILL` cuts it short |
+
+**Steps (each one measured and logged):**
+
+| Step | Test | What it teaches |
+| --- | --- | --- |
+| 0 | **Baseline (failure first):** rolling restart of app1, app2, app3 one at a time (`docker compose restart appN`, 10 s apart) under 3,000 RPS `GET` plus 300 RPS `POST /orders` | The cost of no graceful shutdown: errors, dropped iterations, orders vs `201`s |
+| 1 | `SIGTERM` handler + `Shutdown` only (no readiness change) | Still errors: the load balancer keeps sending for ~3-4 s to an instance that is closing |
+| 2 | Add `/readyz` draining + drain delay + HAProxy checks `/readyz` | The real fix: 0 errors on the rolling restart? |
+| 3 | A request longer than the grace period (for example a frozen database during the restart) | `Shutdown` must give up at its timeout; `SIGKILL` as the last resort. What is lost? |
+| 4 | Redeploy under heavier load: 5,000 RPS (stretch: 10,000, with the caveat that k6 is at its limit there) | Does it hold at the Level 5 load? |
+
+**Related, not part of this level unless you want it:** Level 5 found one run with 55 more orders than `201` responses. That was a DB timeout after the commit, so graceful shutdown doesn't fix it. The usual fix is an **idempotency key** on `POST /orders` (the client sends a unique id; a repeat returns the first result). I'd list it as a separate follow-up.
+
+**Status (2026-11-10): code written; steps 0-4 measured (see section 4); the unbounded `pool.Close()` and the milder-than-expected naive baseline are the open findings.** `GRACEFUL_SHUTDOWN`, `DRAIN_DELAY`, `SHUTDOWN_TIMEOUT`, `LB_HEALTH_PATH`, `STOP_GRACE_PERIOD` (all off or default = naive), a `/readyz` endpoint, `shop.close()`, `make rolling-restart`, `LB_PORT`. Smoke check (one stop, no load): with `LB_HEALTH_PATH=/readyz` HAProxy marked the instance `DOWN` 1.6 s after `SIGTERM` while it kept serving; the process closed the server at 5 s and `docker stop` returned after 5.4 s. Test guide: [LEVEL6_GUIDE.md](LEVEL6_GUIDE.md).
+
+**Decisions (accepted as proposed):** (1) a separate `/readyz`, or switch `/healthz` itself to `503` while draining? (I recommend separate.) (2) A drain delay of 5 s and a shutdown timeout of 15 s are guesses from the 3-4 s detection time measured in Level 5; fine to start with. (3) Who writes the code: Claude implements and you test (as in Level 3), or Claude does it all?
 
 ## 7. Level roadmap
 
@@ -459,7 +520,7 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 | 2 | 0.5 / 512 MB | 1,000 (reached: `/io` ceiling ~8,000; survives 3x `/cpu` spike and 10k slowloris) | Unbounded goroutines and memory under spikes | Timeouts, size limits, GOMEMLIMIT, bounded concurrency, load shedding (fast 503) |
 | 3 | app 0.5 / 512 MB + Postgres 1 / 1 GB + Redis 0.5 / 256 MB | `GET /products/{id}` 5,000 (**reached: 5,000 with cache**) | Connection churn, no timeouts, N+1, no cache, stampedes | Pooling, timeouts, joins, cache-aside, singleflight |
 | 4 | 0.5 / 512 MB | CPU per request down | GC pressure from allocations | Allocation profiling, sync.Pool, cheaper JSON |
-| 5 | 3 app instances + load balancer | 10,000 | A single instance's limit; F7 | Horizontal scaling, load balancer, shedding at the edge |
+| 5 | 3 app instances + load balancer | 10,000 (reached ~10,000 RPS, 2 of 4 runs pass; k6 at its limit) | A single instance's limit; F7 | Horizontal scaling, load balancer, shedding at the edge |
 | 6 | same as 5 | 10,000, 0 errors during redeploys | Dropped requests on shutdown | Graceful shutdown, readiness draining |
 
 `/cpu` at 10k RPS would need ~3.5 full cores (measured ~1,400 RPS per 0.5 CPU). It will hit the hardware limit first, so its target is set separately. Roadmap re-baselined 2026-11-06.
@@ -470,6 +531,7 @@ Newest first. Each entry: what changed, before and after numbers, what limits it
 
 | Date | Level | Change | Before | After | Next bottleneck |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-10 | 6 (steps 0-4) | Measured Level 6: rolling restart of all three instances under load with graceful shutdown off, `SIGTERM` handler only, and readiness drain; a frozen-database shutdown; 5,000 and 10,000 RPS (no code change). | Naive: GET 6 / 0 failed, POST 3 / 19 failed | Readiness drain: GET 0 / 0 failed at 3,000 and 0 / 0 at 5,000; POST 0 / 4 failed, 0 lost orders; 10,000: 1 of 2 runs pass | Naive baseline not as bad as Level 5 suggested, so gain not clearly separable; `pool.Close()` unbounded; POST noise (+74 orders in one step 1 run); idempotency key |
 | 2026-11-10 | 5 (steps 0-5) | Measured Level 5: HAProxy in front of 1 and 3 instances, kill and pause under load, a slow instance with round-robin vs `leastconn`, spike shedding at the lb, and 10,000 RPS (no code change). | 1 instance: ~5,000 RPS (Level 3); lb cost unknown | 3 instances: 5,000 and 8,000 pass mostly, 10,000 passes 2 of 4 runs (dropped iterations only), nothing saturated in steady state; lb adds ~0.03 ms and ~16% CPU at 3,000 RPS; kill = 0 errors but 1 s p99, pause = 1.1% errors | Level 5 not closed: find why 10,000 sometimes drops iterations, a second load generator, a real overload for step 4; Level 6 (graceful drain) |
 | 2026-11-10 | 5 (setup) | HAProxy load balancer plus three app instances (`app1`-`app3`), `make up N=`, `make lbstats`, failure helpers; compose defaults = fixed Level 3 settings; k6 and slowloris target `lb`. Measurements are in the next row. | 1 instance, ~5,000 RPS on `/products/{id}` | see the steps 0-5 row | Step 0 (load balancer cost) through step 5 (first shared limit) |
 | 2026-11-09 | 3 (step 5) | Measured `SINGLEFLIGHT=on` vs off on a cache stampede (one hot key, 1 s TTL, 3,000 RPS), and a 300-request burst on one cold key. | Burst: 300 DB queries; stampede: 7.5 loads per expiry, p99 4.2 ms | Burst: **1** DB query; stampede: **1.0** per expiry, p99 1.1 ms | Hot-row lock on orders (bonus, not run); stampedes at higher rates not tested |

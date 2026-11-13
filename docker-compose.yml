@@ -23,11 +23,19 @@ x-app: &app
     CACHE: "${CACHE:-on}"                # level 3 step 4
     CACHE_TTL: "${CACHE_TTL:-30s}"
     SINGLEFLIGHT: "${SINGLEFLIGHT:-on}"  # level 3 step 5
+    # Level 6: graceful shutdown. Off by default (naive: SIGTERM kills instantly).
+    GRACEFUL_SHUTDOWN: "${GRACEFUL_SHUTDOWN:-off}"
+    DRAIN_DELAY: "${DRAIN_DELAY:-5s}"            # readiness fails, then wait this long before closing
+    SHUTDOWN_TIMEOUT: "${SHUTDOWN_TIMEOUT:-15s}"  # max time to let in-flight requests finish
+    POOL_CLOSE_TIMEOUT: "${POOL_CLOSE_TIMEOUT:-3s}" # max time to wait for the DB pool to close
   depends_on:
     postgres:
       condition: service_healthy
     redis:
       condition: service_started
+  # Docker sends SIGTERM, then SIGKILL after this. Must be longer than
+  # DRAIN_DELAY + SHUTDOWN_TIMEOUT (5 s + 15 s by default). The default is 10 s.
+  stop_grace_period: "${STOP_GRACE_PERIOD:-30s}"
   deploy:
     resources:
       limits:
@@ -40,12 +48,13 @@ services:
   lb:
     image: haproxy:3.0-alpine
     ports:
-      - "8080:8080"           # all traffic enters here
+      - "${LB_PORT:-8080}:8080" # all traffic enters here (LB_PORT if 8080 is taken on your Mac)
       - "127.0.0.1:8404:8404" # HAProxy stats page
     environment:
       LB_BALANCE: "${LB_BALANCE:-roundrobin}"             # step 3: leastconn
       LB_SERVER_MAXCONN: "${LB_SERVER_MAXCONN:-0}"        # step 4: max requests in flight per instance (0 = unlimited)
       LB_QUEUE_TIMEOUT: "${LB_QUEUE_TIMEOUT:-1s}"         # step 4: how long a request may wait for a free slot
+      LB_HEALTH_PATH: "${LB_HEALTH_PATH:-/healthz}"      # level 6 step 2: /readyz = stop sending to draining instances
     volumes:
       - ./lb/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     deploy:

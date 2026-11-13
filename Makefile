@@ -19,6 +19,9 @@
 #   make vars I=2                            counters of instance 2 (pprof/expvar on ports 6061-6063)
 #   make kill-app I=2 / make start-app I=2   kill or restart one instance
 #   make slow-app I=2 / make fast-app I=2    throttle one instance to 0.1 CPU / restore 0.5
+# Level 6 (see docs/LEVEL6_GUIDE.md):
+#   make rolling-restart GAP=10              restart app1, app2, app3 one at a time, GAP seconds apart
+#   make vars                                also prints level6_config
 ENDPOINT ?= /io
 RATE     ?= 100
 DURATION ?= 1m
@@ -30,6 +33,7 @@ FREEZE   ?= 10
 N        ?= 3
 I        ?= 1
 TARGET   ?= http://lb:8080
+GAP      ?= 10
 
 # Quoted: endpoints like /products?category={cat} contain shell glob characters.
 K6_ENV = -e ENDPOINT='$(ENDPOINT)' -e RATE=$(RATE) -e DURATION=$(DURATION) \
@@ -57,7 +61,7 @@ slowloris:
 	docker compose run --rm slowloris -conns $(CONNS) -duration $(DURATION)
 
 vars:
-	@curl -s localhost:606$(I)/debug/vars | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(f"{k:20} {json.dumps(d[k])}") for k in ("level3_config","db_queries","db_connects","db_errors","db_timeouts","db_last_error","cache_hits","cache_misses","cache_errors","singleflight_shared","db_pool") if k in d]'
+	@curl -s localhost:606$(I)/debug/vars | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(f"{k:20} {json.dumps(d[k])}") for k in ("level3_config","level6_config","db_queries","db_connects","db_errors","db_timeouts","db_last_error","cache_hits","cache_misses","cache_errors","singleflight_shared","db_pool") if k in d]'
 
 pgconns:
 	@docker compose exec -T postgres psql -U app -d shop -c "SELECT coalesce(state, 'background') AS state, count(*) FROM pg_stat_activity WHERE datname = 'shop' GROUP BY 1 ORDER BY 2 DESC;"
@@ -77,6 +81,10 @@ stats:
 logs:
 	docker compose logs -f app1 app2 app3 lb
 
+# Simulates a redeploy: restart each instance in turn, waiting GAP seconds in between.
+rolling-restart:
+	@for i in 1 2 3; do echo "restarting app$$i"; docker compose restart app$$i >/dev/null 2>&1; sleep $(GAP); done; echo done
+
 lbstats:
 	@python3 lb/stats.py
 
@@ -92,4 +100,4 @@ slow-app:
 fast-app:
 	docker update --cpus 0.5 $$(docker compose ps -q app$(I))
 
-.PHONY: up down load ramp spike slowloris vars pgconns psql db-freeze db-reset stats logs lbstats kill-app start-app slow-app fast-app
+.PHONY: up down load ramp spike slowloris vars pgconns psql db-freeze db-reset stats logs rolling-restart lbstats kill-app start-app slow-app fast-app

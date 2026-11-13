@@ -410,3 +410,29 @@ func writeRawJSON(w http.ResponseWriter, b []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(b)
 }
+
+// close releases the Postgres pool and the Redis client. Called at the end of a
+// graceful shutdown, after the HTTP server has finished its in-flight requests.
+//
+// pgxpool.Close waits until every borrowed connection is returned. If the
+// database is frozen, a hung query never returns its connection, so Close
+// would block until the database comes back (seen in Level 6 step 3: 20.6 s).
+// So the wait is bounded: after timeout we give up and let the process exit,
+// which closes the sockets anyway.
+func (s *shop) close(timeout time.Duration) {
+	if s.pool != nil {
+		done := make(chan struct{})
+		go func() {
+			s.pool.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			log.Printf("shutdown: pool still has busy connections after %s, giving up", timeout)
+		}
+	}
+	if s.cache != nil {
+		s.cache.Close()
+	}
+}
