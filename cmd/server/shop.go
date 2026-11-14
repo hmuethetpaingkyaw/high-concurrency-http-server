@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,7 +42,12 @@ var (
 	cacheMisses = expvar.NewInt("cache_misses")
 	cacheErrors = expvar.NewInt("cache_errors")
 	sfShared    = expvar.NewInt("singleflight_shared") // callers whose DB load was shared with others (including the one that ran it)
+
+	idempotentReplays = expvar.NewInt("idempotent_replays") // POST /orders answered from an earlier order with the same key
 )
+
+// maxKeyLen is the longest accepted Idempotency-Key.
+const maxKeyLen = 128
 
 // querier is what handlers need from a connection. Both a one-off *pgx.Conn
 // and a pooled *pgxpool.Conn satisfy it.
@@ -69,14 +75,17 @@ type shop struct {
 	cache     *redis.Client // nil when CACHE=off
 	cacheTTL  time.Duration
 	sf        *singleflight.Group // nil when SINGLEFLIGHT=off
+
+	idempotent bool // IDEMPOTENCY=on: honor the Idempotency-Key header on POST /orders
 }
 
 func newShop() *shop {
 	s := &shop{
-		dbURL:     os.Getenv("DATABASE_URL"),
-		dbTimeout: envDuration("DB_TIMEOUT", 0),
-		listJoin:  os.Getenv("LIST_QUERY") == "join",
-		cacheTTL:  envDuration("CACHE_TTL", 30*time.Second),
+		dbURL:      os.Getenv("DATABASE_URL"),
+		dbTimeout:  envDuration("DB_TIMEOUT", 0),
+		listJoin:   os.Getenv("LIST_QUERY") == "join",
+		cacheTTL:   envDuration("CACHE_TTL", 30*time.Second),
+		idempotent: os.Getenv("IDEMPOTENCY") == "on",
 	}
 
 	if os.Getenv("DB_POOL") == "on" {
@@ -133,6 +142,9 @@ func newShop() *shop {
 			"CACHE_TTL":    s.cacheTTL.String(),
 			"SINGLEFLIGHT": s.sf != nil,
 		}
+	}))
+	expvar.Publish("level7_config", expvar.Func(func() any {
+		return map[string]any{"IDEMPOTENCY": s.idempotent}
 	}))
 	return s
 }
@@ -323,6 +335,33 @@ func (s *shop) listProducts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, items)
 }
 
+// idempotencyKey returns the request's Idempotency-Key. ok is false when the
+// header is present but invalid: empty after trimming, longer than maxKeyLen,
+// not printable ASCII, or sent more than once. A missing header is fine
+// ("", true), and with IDEMPOTENCY off the header is ignored.
+func (s *shop) idempotencyKey(r *http.Request) (key string, ok bool) {
+	if !s.idempotent {
+		return "", true
+	}
+	vals, present := r.Header["Idempotency-Key"]
+	if !present {
+		return "", true
+	}
+	if len(vals) != 1 {
+		return "", false
+	}
+	key = strings.TrimSpace(vals[0])
+	if key == "" || len(key) > maxKeyLen {
+		return "", false
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x20 || key[i] > 0x7e {
+			return "", false
+		}
+	}
+	return key, true
+}
+
 // createOrder serves POST /orders {"product_id": 42, "qty": 1}.
 func (s *shop) createOrder(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -331,6 +370,13 @@ func (s *shop) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProductID <= 0 || req.Qty < 1 || req.Qty > 100 {
 		http.Error(w, `body must be {"product_id": >0, "qty": 1-100}`, http.StatusBadRequest)
+		return
+	}
+	// Level 7: with IDEMPOTENCY=on, a present but invalid key is rejected
+	// before any database work. With it off the header is ignored.
+	key, ok := s.idempotencyKey(r)
+	if !ok {
+		http.Error(w, "invalid Idempotency-Key (1-128 printable ASCII characters, one value)", http.StatusBadRequest)
 		return
 	}
 
@@ -342,6 +388,13 @@ func (s *shop) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+
+	// Level 7: a request with a key (switch on) takes its own path. Without a
+	// key, or with the switch off, the original flow below is unchanged.
+	if key != "" {
+		s.createOrderWithKey(ctx, w, c, req.ProductID, req.Qty, key)
+		return
+	}
 
 	tx, err := c.Begin(ctx)
 	if err != nil {
@@ -404,6 +457,87 @@ func dbError(w http.ResponseWriter, err error) {
 		dbLastError.Set(err.Error())
 		http.Error(w, "database error", http.StatusInternalServerError)
 	}
+}
+
+// createOrderWithKey is createOrder for a request with an Idempotency-Key.
+//
+// The order is inserted first, with its key, and the unique index on the key
+// decides: if another transaction already committed an order with this key,
+// the insert does nothing and we answer with that order (a replay). Only a
+// request whose insert succeeded takes the stock, so a replay never takes it
+// twice. If the stock step fails, the rollback also removes the key, so the
+// client may retry later. Two requests with the same key at the same time:
+// the second insert waits for the first transaction to finish, then replays
+// (or proceeds, if the first one rolled back).
+func (s *shop) createOrderWithKey(ctx context.Context, w http.ResponseWriter, c querier, productID, qty int, key string) {
+	tx, err := c.Begin(ctx)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	defer tx.Rollback(context.Background()) // no-op after a successful Commit
+
+	var orderID int64
+	dbQueries.Add(1)
+	err = tx.QueryRow(ctx, `INSERT INTO orders (product_id, qty, idempotency_key) VALUES ($1, $2, $3)
+		ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`, productID, qty, key).Scan(&orderID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Replay: an order with this key is already committed.
+		var prevProduct, prevQty int
+		dbQueries.Add(1)
+		if err := tx.QueryRow(ctx, `SELECT id, product_id, qty FROM orders WHERE idempotency_key = $1`, key).
+			Scan(&orderID, &prevProduct, &prevQty); err != nil {
+			dbError(w, err)
+			return
+		}
+		if prevProduct != productID || prevQty != qty {
+			http.Error(w, "idempotency key was used with a different request", http.StatusUnprocessableEntity)
+			return
+		}
+		idempotentReplays.Add(1)
+		w.Header().Set("Idempotent-Replay", "true")
+		writeOrder(w, http.StatusOK, orderID, productID, qty)
+		return
+	}
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign key: no such product
+			http.Error(w, "unknown product or out of stock", http.StatusConflict)
+			return
+		}
+		dbError(w, err)
+		return
+	}
+
+	dbQueries.Add(1)
+	tag, err := tx.Exec(ctx, `UPDATE inventory SET stock = stock - $2 WHERE product_id = $1 AND stock >= $2`,
+		productID, qty)
+	if err != nil {
+		dbError(w, err)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// The deferred rollback also undoes the insert, so the key is not stored.
+		http.Error(w, "unknown product or out of stock", http.StatusConflict)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		dbError(w, err)
+		return
+	}
+
+	if s.cache != nil {
+		if err := s.cache.Del(ctx, productKey(productID)).Err(); err != nil {
+			cacheErrors.Add(1)
+		}
+	}
+	writeOrder(w, http.StatusCreated, orderID, productID, qty)
+}
+
+func writeOrder(w http.ResponseWriter, status int, orderID int64, productID, qty int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"order_id": orderID, "product_id": productID, "qty": qty})
 }
 
 func writeRawJSON(w http.ResponseWriter, b []byte) {

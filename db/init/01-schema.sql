@@ -20,8 +20,13 @@ CREATE TABLE orders (
     id         bigserial   PRIMARY KEY,
     product_id int         NOT NULL REFERENCES products (id),
     qty        int         NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    -- Level 7: the client's Idempotency-Key. NULL for orders sent without one.
+    -- Same statements as db/migrations/001-idempotency-key.sql (for an existing database).
+    idempotency_key text
 );
+-- A unique index allows many NULLs, so orders without a key never conflict.
+CREATE UNIQUE INDEX orders_idempotency_key_idx ON orders (idempotency_key);
 
 -- 100,000 products across 50 categories (~2,000 each), ~240-byte descriptions.
 INSERT INTO products (id, name, category, price_cents, description)
