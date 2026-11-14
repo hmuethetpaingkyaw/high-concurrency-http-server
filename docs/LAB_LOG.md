@@ -1,6 +1,6 @@
 # High-Concurrency HTTP Server: Lab Log
 
-Last updated: 2026-11-10 · Current level: **Level 6 steps 0-4 measured (graceful shutdown: a rolling restart under load gave 0 failed GETs at 3,000 and 5,000 RPS, 1 of 2 at 10,000; POST not clean); Level 5 finished (3 instances behind HAProxy; 10,000 RPS reached, 2 of 4 runs pass, k6 at its limit)** · Open: Level 6 POST noise (one run 2.51% errors, +74 orders over `201`s, cause unchecked), `pool.Close()` has no timeout (step 3), POST duplicate check (+55 orders in one run), unexplained 5xx/stall in one 10,000 RPS run, Level 5 step 4 overload not reached, 8,000 RPS cache failure (F15), list index (F14). Skipped: Level 4 fixes, hot-row bonus
+Last updated: 2026-11-13 · Current level: **Level 6 finished (graceful shutdown; benefit small in this lab, pool-close bug fixed); Level 7 plan drafted (idempotency key for orders)** · Open: 8,000 RPS cache failure (F15), list index (F14), unexplained 5xx/stall in one 10,000 RPS run, Level 5 step 4 overload not reached. Skipped: Level 4 fixes, hot-row bonus
 
 ## 1. Goal and rules
 
@@ -511,6 +511,39 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 
 **Decisions (accepted as proposed):** (1) a separate `/readyz`, or switch `/healthz` itself to `503` while draining? (I recommend separate.) (2) A drain delay of 5 s and a shutdown timeout of 15 s are guesses from the 3-4 s detection time measured in Level 5; fine to start with. (3) Who writes the code: Claude implements and you test (as in Level 3), or Claude does it all?
 
+### Level 7 plan (draft, 2026-11-13): idempotency key for orders
+
+**Problem:** an order can be saved while the customer never gets the reply (a database timeout after the commit, or a restart mid-request). Level 5 saw 55 such orders in one run, Level 6 saw +74 in another. If the client retries, the order is created twice and the stock drops twice.
+
+**Fix:** the client sends a unique `Idempotency-Key` header. A repeat with the same key returns the first order instead of creating a new one.
+
+**Design (proposed):**
+
+| Piece | Proposal |
+| --- | --- |
+| Switch | `IDEMPOTENCY=on` (default `off`: the header is ignored, the naive behavior) |
+| Storage | New column `orders.idempotency_key` with a unique index. Added to `db/init/01-schema.sql` for fresh databases, and `make migrate` for the existing one |
+| Flow (on) | In one transaction: insert the order with its key `ON CONFLICT DO NOTHING`. Conflict: roll back and return the stored order (`200`, header `Idempotent-Replay: true`). No conflict: take the stock, commit, `201` as today |
+| Same key, different body | `422` (the key was used for another request) |
+| Out of stock | `409` and rollback, so the key is not stored and the client may retry |
+| Key lifetime | Forever in the lab. A real system expires keys after a day or so |
+| k6 | New `RETRY=on` for `POST /orders`: one key per request, up to 2 retries with the same key on a network error or `5xx` |
+
+**Steps (each measured and logged):**
+
+| Step | Test | What it teaches |
+| --- | --- | --- |
+| 0 | Failure first: send the same `POST /orders` twice; then 300 RPS with retries while Postgres freezes for 10 s | Retries create duplicates: orders added > distinct requests |
+| 1 | `IDEMPOTENCY=on`: same key twice, 20 identical requests in parallel, same key with a different body | One order, stock down once, `422` on a mismatch |
+| 2 | Repeat the retrying load with `on`: DB freeze, and a rolling restart without graceful shutdown | Duplicates = 0 even when requests fail and retry |
+| 3 | Cost: POST at 300 and 1,000 RPS, `on` vs `off` | What the unique index and the extra lookup cost in latency and throughput |
+
+**Measure of success:** orders added = the number of distinct keys that were accepted, never more.
+
+**Status (2026-11-13): code written, not measured.** `IDEMPOTENCY` switch (default off), `orders.idempotency_key` with a unique index (`make migrate` for an existing database), `createOrderWithKey` in `shop.go`, `idempotent_replays` and `level7_config` in `make vars`, and a retrying k6 client (`RETRY=on`, `KEY=on`). Functional checks (single requests): same key twice gives `201` then `200` with the same order; other quantity gives `422`; out of stock gives `409` and the key is reusable after restocking; 20 parallel identical requests over 3 instances gave one `201`, nineteen `200`, one row, stock down once (3 of 3 rounds). Test guide: [LEVEL7_GUIDE.md](LEVEL7_GUIDE.md).
+
+**Not in this level:** key expiry, hashing the full request body, and the hot-row lock test.
+
 ## 7. Level roadmap
 
 | Level | Box (CPU / RAM) | Target | Expected bottleneck | Fix to learn |
@@ -522,6 +555,7 @@ All runs: `make load` (constant arrival rate), SLO = p99 < 200 ms, errors < 0.1%
 | 4 | 0.5 / 512 MB | CPU per request down | GC pressure from allocations | Allocation profiling, sync.Pool, cheaper JSON |
 | 5 | 3 app instances + load balancer | 10,000 (reached ~10,000 RPS, 2 of 4 runs pass; k6 at its limit) | A single instance's limit; F7 | Horizontal scaling, load balancer, shedding at the edge |
 | 6 | same as 5 | 10,000, 0 errors during redeploys | Dropped requests on shutdown | Graceful shutdown, readiness draining |
+| 7 | same as 5 | No duplicate orders under retries | Saved-but-unanswered orders | Idempotency keys |
 
 `/cpu` at 10k RPS would need ~3.5 full cores (measured ~1,400 RPS per 0.5 CPU). It will hit the hardware limit first, so its target is set separately. Roadmap re-baselined 2026-11-06.
 

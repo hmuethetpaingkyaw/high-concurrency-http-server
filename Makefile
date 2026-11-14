@@ -22,6 +22,10 @@
 # Level 6 (see docs/LEVEL6_GUIDE.md):
 #   make rolling-restart GAP=10              restart app1, app2, app3 one at a time, GAP seconds apart
 #   make vars                                also prints level6_config
+# Level 7 (see docs/LEVEL7_GUIDE.md):
+#   make migrate                             add the idempotency key column to an existing database
+#   make load ENDPOINT=/orders METHOD=POST RETRY=on KEY=on    retrying client; KEY=off = naive retries
+#   IDEMPOTENCY=on make up                   server honors the Idempotency-Key header
 ENDPOINT ?= /io
 RATE     ?= 100
 DURATION ?= 1m
@@ -34,11 +38,13 @@ N        ?= 3
 I        ?= 1
 TARGET   ?= http://lb:8080
 GAP      ?= 10
+RETRY    ?= off
+KEY      ?= off
 
 # Quoted: endpoints like /products?category={cat} contain shell glob characters.
 K6_ENV = -e ENDPOINT='$(ENDPOINT)' -e RATE=$(RATE) -e DURATION=$(DURATION) \
          -e METHOD=$(METHOD) -e HOT_KEYS=$(HOT_KEYS) -e HOT_RATIO=$(HOT_RATIO) \
-         -e TARGET=$(TARGET)
+         -e TARGET=$(TARGET) -e RETRY=$(RETRY) -e KEY=$(KEY)
 
 # N instances (1-3) behind the load balancer. Instances above N are stopped.
 up:
@@ -61,13 +67,17 @@ slowloris:
 	docker compose run --rm slowloris -conns $(CONNS) -duration $(DURATION)
 
 vars:
-	@curl -s localhost:606$(I)/debug/vars | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(f"{k:20} {json.dumps(d[k])}") for k in ("level3_config","level6_config","db_queries","db_connects","db_errors","db_timeouts","db_last_error","cache_hits","cache_misses","cache_errors","singleflight_shared","db_pool") if k in d]'
+	@curl -s localhost:606$(I)/debug/vars | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(f"{k:20} {json.dumps(d[k])}") for k in ("level3_config","level6_config","level7_config","idempotent_replays","db_queries","db_connects","db_errors","db_timeouts","db_last_error","cache_hits","cache_misses","cache_errors","singleflight_shared","db_pool") if k in d]'
 
 pgconns:
 	@docker compose exec -T postgres psql -U app -d shop -c "SELECT coalesce(state, 'background') AS state, count(*) FROM pg_stat_activity WHERE datname = 'shop' GROUP BY 1 ORDER BY 2 DESC;"
 
 psql:
 	docker compose exec postgres psql -U app -d shop
+
+# Applies db/migrations/*.sql to the running database. Safe to run twice.
+migrate:
+	@for f in db/migrations/*.sql; do echo "applying $$f"; docker compose exec -T postgres psql -U app -d shop -v ON_ERROR_STOP=1 -q < $$f; done
 
 db-freeze:
 	docker compose pause postgres && sleep $(FREEZE) && docker compose unpause postgres
@@ -100,4 +110,4 @@ slow-app:
 fast-app:
 	docker update --cpus 0.5 $$(docker compose ps -q app$(I))
 
-.PHONY: up down load ramp spike slowloris vars pgconns psql db-freeze db-reset stats logs rolling-restart lbstats kill-app start-app slow-app fast-app
+.PHONY: up down load ramp spike slowloris vars pgconns psql migrate db-freeze db-reset stats logs rolling-restart lbstats kill-app start-app slow-app fast-app

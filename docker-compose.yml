@@ -23,6 +23,8 @@ x-app: &app
     CACHE: "${CACHE:-on}"                # level 3 step 4
     CACHE_TTL: "${CACHE_TTL:-30s}"
     SINGLEFLIGHT: "${SINGLEFLIGHT:-on}"  # level 3 step 5
+    # Level 7: honor the Idempotency-Key header on POST /orders (off = ignored).
+    IDEMPOTENCY: "${IDEMPOTENCY:-off}"
     # Level 6: graceful shutdown. Off by default (naive: SIGTERM kills instantly).
     GRACEFUL_SHUTDOWN: "${GRACEFUL_SHUTDOWN:-off}"
     DRAIN_DELAY: "${DRAIN_DELAY:-5s}"            # readiness fails, then wait this long before closing

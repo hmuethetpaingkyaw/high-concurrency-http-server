@@ -5,7 +5,7 @@
 //   MODE=ramp      climb from 10 to RATE         (find the breaking point)
 //   MODE=spike     hold RATE far above capacity  (overload: fast 503s are a pass)
 import http from 'k6/http';
-import { Rate } from 'k6/metrics';
+import { Counter, Rate } from 'k6/metrics';
 
 const TARGET = __ENV.TARGET || 'http://lb:8080';
 const ENDPOINT = __ENV.ENDPOINT || '/io';
@@ -13,6 +13,14 @@ const RATE = Number(__ENV.RATE || 100);
 const DURATION = __ENV.DURATION || '1m';
 const MODE = __ENV.MODE || 'constant';
 const METHOD = __ENV.METHOD || 'GET';
+
+// Level 7, POST /orders only (both default to off, which is the old behavior):
+//   RETRY=on  retry up to 2 more times when the request fails (network error or 5xx)
+//   KEY=on    send an Idempotency-Key header, one per request, the same on every retry
+// RETRY=on KEY=off is a naive client: retries can create duplicate orders.
+const RETRY = __ENV.RETRY === 'on';
+const SEND_KEY = __ENV.KEY === 'on';
+const RUN = Date.now(); // keeps keys unique across runs (they are kept forever)
 
 // Level 3 placeholders in ENDPOINT: {id} becomes a product id, {cat} a category.
 // Real traffic is skewed: HOT_RATIO of requests go to the HOT_KEYS most
@@ -32,6 +40,10 @@ const preAllocatedVUs = Math.max(20, Math.ceil(RATE / 5));
 // and only counts anything else (other codes, timeouts, resets) as a failure.
 const shed = new Rate('shed');
 const unexpected = new Rate('unexpected');
+// POST /orders with RETRY: one "order request" is one customer intent, however many attempts it took.
+const orderRequests = new Counter('order_requests'); // intents sent
+const orderRetries = new Counter('order_retries'); // extra attempts after a failure
+const orderOk = new Counter('order_ok'); // intents whose final answer was 2xx
 if (MODE === 'spike') {
   http.setResponseCallback(http.expectedStatuses(200, 503));
 }
@@ -97,7 +109,21 @@ export default function () {
   let res;
   if (METHOD === 'POST') {
     // POST /orders: buy one unit of a (possibly hot) product.
-    res = http.post(`${TARGET}${path}`, JSON.stringify({ product_id: pickId(), qty: 1 }), params);
+    const body = JSON.stringify({ product_id: pickId(), qty: 1 });
+    if (SEND_KEY) {
+      params.headers['Idempotency-Key'] = `k6-${RUN}-${__VU}-${__ITER}`;
+    }
+    const maxAttempts = RETRY ? 3 : 1;
+    let attempts = 0;
+    do {
+      res = http.post(`${TARGET}${path}`, body, params);
+      attempts++;
+    } while (attempts < maxAttempts && (res.status === 0 || res.status >= 500));
+    if (RETRY || SEND_KEY) {
+      orderRequests.add(1);
+      orderRetries.add(attempts - 1);
+      orderOk.add(res.status >= 200 && res.status < 300 ? 1 : 0);
+    }
   } else {
     // A unique query suffix so no two /cpu requests hash the same input.
     const sep = path.includes('?') ? '&' : '?';
